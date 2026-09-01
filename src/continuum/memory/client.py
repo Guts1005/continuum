@@ -10,6 +10,7 @@ import threading
 from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from continuum.llm.untrusted_content import strip_hidden_chars
 from continuum.logging import get_logger
 from continuum.memory.base import BaseMemoryProvider
 from continuum.memory.config import MemoryConfig
@@ -31,6 +32,46 @@ if TYPE_CHECKING:
     from continuum.security.policy import PolicyStore
 
 T = TypeVar("T")
+
+
+def _strip_hidden_from_messages(
+    messages: str | list[dict[str, Any]] | list[str],
+) -> str | list[dict[str, Any]] | list[str]:
+    """Remove invisible codepoints from anything on its way into long-term memory.
+
+    A zero-width or bidi-override sequence carries instructions the model's
+    tokenizer reads while a human reviewer, a query over the collection, and a
+    text classifier do not. ``_clean_tool`` already closes that channel for tool
+    descriptions on first contact; memory is the same channel with a far longer
+    half-life, because a stored payload is replayed into every future session.
+
+    Done on write rather than on read on purpose. This is the only point where
+    the payload can be destroyed rather than labelled, and it protects readers
+    that never come through this SDK -- a dashboard, an export, another service
+    querying the same collection.
+
+    Copy-not-mutate: the session save loop reuses its message dicts, and editing
+    in place would change what the short-term store persists.
+    """
+    if isinstance(messages, str):
+        return strip_hidden_chars(messages)
+    if not isinstance(messages, list):
+        return messages
+
+    cleaned: list[Any] = []
+    for item in messages:
+        if isinstance(item, str):
+            cleaned.append(strip_hidden_chars(item))
+        elif isinstance(item, dict):
+            content = item.get("content")
+            if isinstance(content, str):
+                cleaned.append({**item, "content": strip_hidden_chars(content)})
+            else:
+                cleaned.append(item)  # structured content: left as-is
+        else:
+            cleaned.append(item)
+    return cleaned  # type: ignore[return-value]
+
 
 logger = get_logger(__name__)
 
@@ -97,6 +138,7 @@ class MemoryClient:
         self._config = config or MemoryConfig()
         self._provider = provider
         self._initialized = False
+        self._warned_shared_write = False
 
         if auto_initialize and self._config.enabled:
             self._initialize_provider()
@@ -287,6 +329,24 @@ class MemoryClient:
         # Build scope from identifiers
         scope = self._build_scope(user_id, agent_id, conversation_id)
         identifiers = scope.to_identifiers()
+
+        # A shared-scope write is global knowledge: one user's poisoned memory
+        # becomes every user's retrieved fact, with no per-user scoping between
+        # them. Permitted, and a legitimate deployment choice -- but not one to
+        # arrive at by leaving a config field at a value set months ago, so say
+        # it once on the path that actually does it.
+        if self._config.memory_isolation == "shared" and not self._warned_shared_write:
+            self._warned_shared_write = True
+            logger.warning(
+                "memory_isolation='shared': this write goes to a single global scope "
+                "visible to every user and agent, so anything stored here -- including a "
+                "fact extracted from attacker-influenced content -- is recalled for "
+                "everyone. Set MEMORY_ISOLATION=user (the default) unless a shared "
+                "knowledge base is intended, and deny 'memory:shared' in a PolicyStore "
+                "for runs whose data must not become global."
+            )
+
+        messages = _strip_hidden_from_messages(messages)
 
         # Convert metadata if needed
         if isinstance(metadata, MemoryMetadata):

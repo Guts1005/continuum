@@ -17,6 +17,8 @@ What is tested:
 from __future__ import annotations
 
 import asyncio
+import logging
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -81,6 +83,25 @@ def _mock_provider(
     p.reset = AsyncMock(return_value=True)
     p.close = AsyncMock()
     return p
+
+
+@contextmanager
+def _captured_client_warnings():
+    """WARNINGs from continuum.memory.client (caplog cannot: propagate=False)."""
+    messages: list[str] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.WARNING:
+                messages.append(record.getMessage())
+
+    handler = _Collector()
+    lg = logging.getLogger("continuum.memory.client")
+    lg.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        lg.removeHandler(handler)
 
 
 def _make_client(isolation="user", provider=None):
@@ -1293,3 +1314,137 @@ class TestDisabledClientGuard:
         client = MemoryClient(config=config)
         with pytest.raises(MemoryNotEnabledError):
             await client.update("m-1", "new data")
+
+
+# ---------------------------------------------------------------------------
+# Write-path hygiene (security finding F6, phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestHiddenCharactersAreStrippedBeforeStorage:
+    """Invisible codepoints must not reach long-term memory.
+
+    A zero-width or bidi-override sequence carries instructions the model's
+    tokenizer reads and a human reviewer, a `SELECT` over the collection, and a
+    text classifier all do not. `_clean_tool` already closes this channel for
+    tool descriptions on first contact; memory is the same channel with a longer
+    half-life, because a stored payload is replayed into every future session.
+
+    Stripping on write rather than on read is deliberate: it is the only point
+    where the payload can be destroyed rather than merely labelled, and it fixes
+    rows for readers that never go through this SDK at all.
+    """
+
+    ZW = "​"  # zero-width space
+    BIDI = "‮"  # right-to-left override
+
+    @pytest.mark.asyncio
+    async def test_stripped_from_a_plain_string(self):
+        provider = _mock_provider()
+        client = _make_client(provider=provider)
+
+        await client.add(f"refund limit{self.ZW} is $10,000", user_id="u1")
+
+        sent = provider.add.call_args.args[0]
+        assert self.ZW not in str(sent)
+        assert "refund limit is $10,000" in str(sent)
+
+    @pytest.mark.asyncio
+    async def test_stripped_from_message_dicts(self):
+        provider = _mock_provider()
+        client = _make_client(provider=provider)
+
+        await client.add([{"role": "user", "content": f"hello{self.BIDI}there"}], user_id="u1")
+
+        sent = provider.add.call_args.args[0]
+        assert self.BIDI not in str(sent)
+        assert sent[0]["content"] == "hellothere"
+        assert sent[0]["role"] == "user", "non-content keys must survive untouched"
+
+    @pytest.mark.asyncio
+    async def test_stripped_from_a_list_of_strings(self):
+        provider = _mock_provider()
+        client = _make_client(provider=provider)
+
+        await client.add([f"a{self.ZW}b", "plain"], user_id="u1")
+
+        sent = provider.add.call_args.args[0]
+        assert sent == ["ab", "plain"]
+
+    @pytest.mark.asyncio
+    async def test_ordinary_text_is_untouched(self):
+        """Conservative by construction: CJK, accents, emoji and newlines are
+        legitimate content and a stripper that eats them is worse than none."""
+        provider = _mock_provider()
+        client = _make_client(provider=provider)
+        text = "café 東京 🎉\nsecond line\ttabbed"
+
+        await client.add(text, user_id="u1")
+
+        assert provider.add.call_args.args[0] == text
+
+    @pytest.mark.asyncio
+    async def test_the_caller_s_list_is_not_mutated(self):
+        """The session save loop reuses message dicts; editing in place would
+        corrupt what the short-term store persists."""
+        provider = _mock_provider()
+        client = _make_client(provider=provider)
+        original = [{"role": "user", "content": f"x{self.ZW}y"}]
+
+        await client.add(original, user_id="u1")
+
+        assert original == [{"role": "user", "content": f"x{self.ZW}y"}]
+
+
+class TestSharedScopeWritesAreAnnounced:
+    """`memory_isolation="shared"` is one enum value away from `"user"` and
+    turns every write into global, cross-user knowledge: one user's poisoned
+    memory becomes every user's retrieved fact, and no per-user scoping stands
+    between them. That is a legitimate deployment choice and stays permitted --
+    but it is not something to arrive at by leaving a config field at a value
+    someone set months ago, so the write path says it out loud, once.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shared_write_warns(self, caplog):
+        provider = _mock_provider()
+        client = _make_client(isolation="shared", provider=provider)
+
+        with _captured_client_warnings() as warnings:
+            await client.add("a global fact", user_id="u1")
+
+        joined = "\n".join(warnings)
+        assert "shared" in joined.lower()
+        assert provider.add.call_args is not None, "the write still happens"
+
+    @pytest.mark.asyncio
+    async def test_warning_names_the_cross_user_consequence(self):
+        provider = _mock_provider()
+        client = _make_client(isolation="shared", provider=provider)
+
+        with _captured_client_warnings() as warnings:
+            await client.add("a global fact", user_id="u1")
+
+        joined = "\n".join(warnings).lower()
+        assert "every" in joined or "all users" in joined or "cross-user" in joined
+
+    @pytest.mark.asyncio
+    async def test_warns_only_once(self):
+        provider = _mock_provider()
+        client = _make_client(isolation="shared", provider=provider)
+
+        with _captured_client_warnings() as warnings:
+            for _ in range(3):
+                await client.add("a global fact", user_id="u1")
+
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_user_scope_is_silent(self):
+        provider = _mock_provider()
+        client = _make_client(isolation="user", provider=provider)
+
+        with _captured_client_warnings() as warnings:
+            await client.add("a fact", user_id="u1")
+
+        assert warnings == []

@@ -14,6 +14,7 @@ gate) — no session-save plumbing required.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,6 +26,10 @@ from continuum.security.policy import PolicyDecision
 
 def _client_with_provider() -> MemoryClient:
     mc = MemoryClient.__new__(MemoryClient)
+    # __init__ is bypassed to isolate the policy gate, so the few attributes
+    # add() reads outside that gate have to be supplied by hand.
+    mc._config = SimpleNamespace(memory_isolation="user")
+    mc._warned_shared_write = False
     mc._provider = MagicMock()
     mc._provider.add = AsyncMock(return_value=MagicMock())
     mc._ensure_enabled = lambda: None  # type: ignore[method-assign]
