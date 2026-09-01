@@ -19,6 +19,28 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _row_provenance_labels(rows: list[Any]) -> set[str]:
+    """Collect provenance labels stamped on retrieved memory rows.
+
+    Tolerant by design. Row metadata is third-party data round-tripped through a
+    vector store, so a malformed stamp is a data problem, not a reason to fail a
+    read: one bad row must not take down every retrieval for that user. Anything
+    that is not a list/tuple of strings is skipped.
+
+    ``list``/``tuple`` only, deliberately -- a bare ``str`` and a ``dict`` are
+    both iterable, so accepting "any iterable" would silently taint a run with
+    the characters of a string or the keys of a dict.
+    """
+    from continuum.memory.types import PROVENANCE_LABELS_KEY
+
+    labels: set[str] = set()
+    for row in rows:
+        raw = (getattr(row, "metadata", None) or {}).get(PROVENANCE_LABELS_KEY)
+        if isinstance(raw, list | tuple):
+            labels.update(x for x in raw if isinstance(x, str))
+    return labels
+
+
 class MemoryService(IMemoryService):
     """
     Service for memory integration.
@@ -165,6 +187,18 @@ class MemoryService(IMemoryService):
                 scope_labels = agent.memory_config.scope_data_labels.get(search_scope)
                 if scope_labels:
                     context.taint(*scope_labels)
+
+                # Row provenance (security finding F6): a row stamped by the run
+                # that wrote it re-taints the run that reads it. Additive with the
+                # scope labels above -- scope answers "is this store sensitive",
+                # the row answers "was this particular fact derived from
+                # untrusted input", and only the second can separate a genuine
+                # user preference from a planted one sitting in the same scope.
+                #
+                # This is the half that does not depend on the model cooperating:
+                # once the label is on the run, the tool gate denies the action
+                # whatever the model was persuaded to believe.
+                context.taint(*_row_provenance_labels(memories.results))
 
                 # Log memory search summary at DEBUG level
                 logger.debug(

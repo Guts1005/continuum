@@ -20,6 +20,7 @@ from continuum.memory.exceptions import (
 from continuum.memory.providers import create_provider, list_providers
 from continuum.memory.scopes import MemoryScope
 from continuum.memory.types import (
+    PROVENANCE_LABELS_KEY,
     MemoryAddResult,
     MemoryEntry,
     MemoryMetadata,
@@ -292,6 +293,24 @@ class MemoryClient:
             metadata_dict = metadata.to_dict()
         else:
             metadata_dict = metadata
+
+        # Provenance stamp (security finding F6).
+        #
+        # Record how tainted the run that produced this memory was, so a later
+        # run that recalls the row can inherit the taint and be gated on it. The
+        # labels come from the same resolution the write gate above uses, so the
+        # session-save path -- which never threads RunContext -- is covered by
+        # the ambient publish rather than needing a new parameter.
+        #
+        # Copy-not-mutate: the caller's dict is reused across messages in a save
+        # loop, so stamping in place would leak one message's labels onto the
+        # next. Absent labels write no key at all: a clean row must stay clean so
+        # the read side can tell "never labelled" from "labelled with nothing".
+        if eff_labels:
+            metadata_dict = {
+                **(metadata_dict or {}),
+                PROVENANCE_LABELS_KEY: sorted(eff_labels),
+            }
 
         return await self._provider.add(
             messages,

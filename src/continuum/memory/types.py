@@ -9,6 +9,24 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+PROVENANCE_LABELS_KEY = "_data_labels"
+"""Metadata key carrying a row's provenance labels (security finding F6).
+
+The taint labels active on the run that produced a memory, stamped on write and
+read back to re-taint any run that recalls the row. Underscore-prefixed to match
+the internal metadata convention (``_user_id``, ``_agent_id``) and to stay out of
+the way of integrator-supplied keys.
+
+Stored as a sorted ``list[str]``: metadata round-trips through the vector store
+as JSON, where a ``set`` is not serialisable and its iteration order is not
+stable. Sorting keeps a row's stamp byte-identical for the same label set.
+
+Why row-level rather than only scope-level: ``scope_data_labels`` taints on the
+scope being read, which cannot separate a preference the user genuinely stated
+from a sentence an attacker planted upstream and the model echoed -- both land as
+rows in the same scope. The row's own provenance can.
+"""
+
 
 class MemoryMetadata(BaseModel):
     """Metadata for a memory entry."""
