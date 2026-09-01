@@ -27,6 +27,21 @@ logger = get_logger(__name__)
 
 MEMORY_HEADER = "User profile (long-term preferences and context):"
 
+CACHE_BREAKPOINT_KEY = "cache_breakpoint_index"
+"""Index of the first prompt block whose bytes change from turn to turn.
+
+Anthropic caches the prefix up to and including the block carrying
+``cache_control``, so anything volatile sitting inside that prefix changes its
+hash and the breakpoint never hits. The builder is what knows which blocks are
+volatile -- retrieved memory is a similarity search on the current input, and
+pipeline context carries a prior step's output -- so it records where they start
+and the executor places the marker before them.
+
+Recorded on ``context.metadata`` rather than on the message dicts: providers
+build their payloads from those dicts, and an unrecognised key would ride along
+to the API.
+"""
+
 
 def _render_memory_context(memories: list[dict[str, Any]]) -> str:
     """Render retrieved memories, fencing only the rows provenance marks untrusted.
@@ -220,7 +235,10 @@ class MessageBuilder(IMessageBuilder):
                     f"Failed to validate/inject tool context state: {e}. Continuing without it."
                 )
 
-        # Inject memory facts early (user profile/background — stable context like instructions)
+        # Retrieved memory. NOT stable context, despite where it sits: this is a
+        # similarity search on the current turn's input, so its bytes change
+        # almost every turn. CACHE_BREAKPOINT_KEY is recorded below so the
+        # executor places the prompt-cache marker before it rather than after.
         if agent.memory_config and agent.memory_config.search_memories and self._memory_service:
             try:
                 query = input if isinstance(input, str) else str(input)
@@ -228,6 +246,8 @@ class MessageBuilder(IMessageBuilder):
 
                 if memories:
                     memory_content = _render_memory_context(memories)
+                    if memory_content and context.metadata is not None:
+                        context.metadata.setdefault(CACHE_BREAKPOINT_KEY, len(messages))
 
                     logger.info(f"💾 Injecting {len(memories)} memories into LLM context")
                     logger.debug(f"💾 Memory context content:\n{memory_content}")
@@ -241,6 +261,9 @@ class MessageBuilder(IMessageBuilder):
         # so sub-agents can see prior steps' outputs without loading Redis.
         pipeline_ctx = context.metadata.get("pipeline_context") if context.metadata else None
         if pipeline_ctx:
+            # setdefault, not assignment: the marker goes before the FIRST
+            # volatile block, and memory (above) may already have claimed it.
+            context.metadata.setdefault(CACHE_BREAKPOINT_KEY, len(messages))
             messages.append({"role": "system", "content": pipeline_ctx})
 
         # Load session history if available.

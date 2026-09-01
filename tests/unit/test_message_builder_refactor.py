@@ -396,3 +396,151 @@ def _make_builder_with_memories(memories):
         mem_svc,
         sess_svc,
     )
+
+
+# ---------------------------------------------------------------------------
+# Where the prompt-cache breakpoint goes (phase 4 — performance, not security)
+#
+# Anthropic caches the prompt prefix up to and including the block carrying
+# `cache_control`. Continuum sets that marker on the tool catalogue
+# (tool_attention/router.py) and inserts the catalogue after the whole leading
+# run of system messages (execution/executor.py).
+#
+# The memory block sits inside that run, and it is a similarity search on the
+# current turn's input -- so its bytes change almost every turn. A varying block
+# inside the cached prefix changes the prefix hash, so the breakpoint never hits
+# and the agent's own system prompt is re-billed every turn. On Anthropic it is
+# worse than the position suggests: the provider hoists every system message
+# into the top-level `system` param regardless of where it sits, so the varying
+# text lands at the very front of the request.
+#
+# The fix is ordering, not content: put the marker BEFORE the volatile blocks.
+# Content after a breakpoint does not invalidate what precedes it, so the stable
+# prefix starts hitting and only the tail is reprocessed. Nothing the model sees
+# changes -- same bytes, same order relative to the question.
+#
+# The builder is what knows which blocks are volatile, so it records the index
+# and the executor honours it. Recorded in context.metadata rather than on the
+# message dicts: providers build payloads from those dicts, and an unrecognised
+# key would ride along to the API.
+# ---------------------------------------------------------------------------
+
+BREAKPOINT_KEY = "cache_breakpoint_index"
+
+
+def _idx(messages, needle):
+    for i, m in enumerate(messages):
+        if needle in str(m.get("content", "")):
+            return i
+    return None
+
+
+class TestBuilderRecordsWhereVolatileContentStarts:
+    async def test_index_points_at_the_memory_block(self):
+        agent = _make_agent()
+        agent.memory_config.search_memories = True
+        builder, _, _ = _make_builder_with_memories([_clean("Prefers bullet points")])
+        ctx = create_run_context(user_id="u1")
+
+        messages, _ = await builder.prepare_messages(agent, "hello", ctx)
+
+        bp = ctx.metadata.get(BREAKPOINT_KEY)
+        assert bp is not None
+        assert bp == _idx(messages, "User profile (long-term")
+
+    async def test_everything_before_the_index_is_stable_content(self):
+        """The agent's own system prompt must end up inside the cached prefix --
+        that is the whole point of moving the marker."""
+        agent = _make_agent(system_prompt="You are a refund assistant.")
+        agent.memory_config.search_memories = True
+        builder, _, _ = _make_builder_with_memories([_clean("Prefers bullet points")])
+        ctx = create_run_context(user_id="u1")
+
+        messages, _ = await builder.prepare_messages(agent, "hello", ctx)
+        bp = ctx.metadata[BREAKPOINT_KEY]
+
+        prefix = "\n".join(str(m.get("content", "")) for m in messages[:bp])
+        assert "You are a refund assistant." in prefix
+        assert "User profile (long-term" not in prefix
+
+    async def test_no_memory_means_no_index_recorded(self):
+        """Nothing volatile, so nothing to move the marker for -- the executor
+        keeps its existing placement."""
+        agent = _make_agent()
+        agent.memory_config.search_memories = False
+        builder, _, _ = _make_builder_with_memories([])
+        ctx = create_run_context(user_id="u1")
+
+        await builder.prepare_messages(agent, "hello", ctx)
+
+        assert ctx.metadata.get(BREAKPOINT_KEY) is None
+
+    async def test_pipeline_context_also_counts_as_volatile(self):
+        """pipeline_context carries a prior step's output, so it changes between
+        runs the same way memory does."""
+        agent = _make_agent()
+        agent.memory_config.search_memories = False
+        builder, _, _ = _make_builder_with_memories([])
+        ctx = create_run_context(user_id="u1")
+        ctx.metadata["pipeline_context"] = "step 1 produced: 42"
+
+        messages, _ = await builder.prepare_messages(agent, "hello", ctx)
+
+        bp = ctx.metadata.get(BREAKPOINT_KEY)
+        assert bp is not None
+        assert bp == _idx(messages, "step 1 produced: 42")
+
+    async def test_memory_wins_when_both_are_present(self):
+        """The marker goes before the FIRST volatile block, not the last."""
+        agent = _make_agent()
+        agent.memory_config.search_memories = True
+        builder, _, _ = _make_builder_with_memories([_clean("Prefers bullet points")])
+        ctx = create_run_context(user_id="u1")
+        ctx.metadata["pipeline_context"] = "step 1 produced: 42"
+
+        messages, _ = await builder.prepare_messages(agent, "hello", ctx)
+        bp = ctx.metadata[BREAKPOINT_KEY]
+
+        assert bp == _idx(messages, "User profile (long-term")
+        assert bp < _idx(messages, "step 1 produced: 42")
+
+
+class TestCatalogueInsertPosition:
+    """The executor's placement of the cache-marked tool catalogue."""
+
+    def _messages(self):
+        return [
+            {"role": "system", "content": "agent prompt"},
+            {"role": "system", "content": "tool context"},
+            {"role": "system", "content": "User profile (long-term ...)"},
+            {"role": "user", "content": "hi"},
+        ]
+
+    def test_honours_a_recorded_breakpoint(self):
+        from continuum.agent.execution.executor import _catalogue_insert_index
+
+        assert _catalogue_insert_index(self._messages(), 2) == 2
+
+    def test_falls_back_to_the_end_of_the_system_run(self):
+        """Older callers record nothing; behaviour must be exactly as before."""
+        from continuum.agent.execution.executor import _catalogue_insert_index
+
+        assert _catalogue_insert_index(self._messages(), None) == 3
+
+    def test_a_nonsense_index_falls_back_rather_than_crashing(self):
+        from continuum.agent.execution.executor import _catalogue_insert_index
+
+        for bad in (-1, 99, "two", 1.5):
+            assert _catalogue_insert_index(self._messages(), bad) == 3
+
+    def test_catalogue_lands_before_the_volatile_block(self):
+        from continuum.agent.execution.executor import _catalogue_insert_index
+
+        msgs = self._messages()
+        at = _catalogue_insert_index(msgs, 2)
+        out = msgs[:at] + [{"role": "system", "content": "TOOL CATALOGUE"}] + msgs[at:]
+
+        cat = _idx(out, "TOOL CATALOGUE")
+        mem = _idx(out, "User profile")
+        assert cat < mem, "the marker must precede the block that changes every turn"
+        assert _idx(out, "agent prompt") < cat, "the stable prompt stays in the prefix"
