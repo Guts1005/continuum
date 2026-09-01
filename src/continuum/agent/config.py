@@ -55,8 +55,22 @@ class AgentMemoryConfig:
     # Memory policy hooks — product-level customization (domain-agnostic in SDK)
     # extraction_prompt: custom fact extraction prompt; if None, mem0 default is used
     extraction_prompt: str | None = None
-    # pre_store_filter: called with extracted fact texts after storage;
-    # facts not returned by the filter are deleted from the vector store (best-effort)
+    # pre_store_filter: despite the name, this runs AFTER the write, not before
+    # it. mem0 fuses fact extraction and storage inside a single add() call and
+    # exposes no extract-without-store path (checked in 1.0.11 and 2.0.19), so
+    # the facts do not exist until they are already persisted. The filter is
+    # given the extracted texts and returns the subset to keep; the rest are
+    # deleted. Measured against a live Milvus, a rejected fact is searchable for
+    # roughly 280ms before the delete lands.
+    #
+    # Treat it as damage control, not a gate. If a class of content must never
+    # touch the vector store at all, keep it out of the messages -- or disable
+    # extraction (infer=False), where what you pass is exactly what is stored and
+    # filtering the input really is filtering the row.
+    #
+    # It fails closed: a filter that raises rejects every fact from that write,
+    # and a fact that cannot be confirmed deleted stays in the list handed to
+    # on_stored rather than being reported as removed.
     pre_store_filter: MemoryPreStoreFilter | None = field(
         default=None, repr=False, compare=False, hash=False
     )

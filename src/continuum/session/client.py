@@ -683,26 +683,85 @@ class SessionClient:
                     if fact_text:
                         stored_pairs.append((fact_text, fact_id))
 
-                # Apply pre_store_filter: delete facts that don't pass (best-effort)
+                # Apply pre_store_filter.
+                #
+                # The name promises a gate before the write; the write already
+                # happened above. That ordering cannot be fixed here -- mem0
+                # fuses extraction and storage inside one call and exposes no
+                # extract-without-store path in 1.x or 2.x -- so the filter can
+                # only delete what was just persisted. Measured against a live
+                # Milvus, a rejected fact is searchable for roughly 280ms.
+                #
+                # Every failure in that undo path used to fail OPEN and quietly:
+                # a filter that raised kept everything, a missing id skipped the
+                # delete in silence, and a failed delete was logged at warning
+                # and then reported to on_stored as removed. Those leave the
+                # fact in the store permanently, which is far worse than 280ms.
+                # So each one now fails closed and says so at ERROR.
                 if pre_store_filter and stored_pairs:
                     fact_texts = [t for t, _ in stored_pairs]
                     try:
                         allowed = set(pre_store_filter(fact_texts))
                     except Exception as fe:
-                        logger.warning(f"pre_store_filter failed: {fe}")
-                        allowed = set(fact_texts)
+                        # A filter that cannot answer has told us nothing about
+                        # what was written, so none of it may stay. Rejecting
+                        # everything loses benign memory; keeping everything
+                        # loses the guarantee the filter was added to provide.
+                        logger.error(
+                            "pre_store_filter raised (%s: %s) — rejecting all %d fact(s) from this "
+                            "write, since nothing is known about their contents",
+                            type(fe).__name__,
+                            fe,
+                            len(fact_texts),
+                        )
+                        allowed = set()
+
                     filtered_out = [(t, i) for t, i in stored_pairs if t not in allowed]
                     if filtered_out:
+                        # Count and ids only. The text is what the filter exists
+                        # to keep out of persistent stores, and a log is usually
+                        # the less guarded of the two.
                         logger.info(
-                            f"🚫 PII filter blocked {len(filtered_out)} fact(s): {[t for t, _ in filtered_out]}"
+                            "🚫 pre_store_filter rejected %d fact(s): %s",
+                            len(filtered_out),
+                            [i or "<no id>" for _, i in filtered_out],
                         )
+
+                    # Only facts confirmed deleted leave `stored_pairs`. Anything
+                    # still in the store stays on the list, so on_stored remains
+                    # an accurate record rather than a reassuring one.
+                    undeletable: list[str] = []
                     for _fact_text, fact_id in filtered_out:
-                        if fact_id:
-                            try:
-                                await self.memory_client.delete(fact_id)
-                            except Exception as de:
-                                logger.warning(f"Failed to delete filtered fact {fact_id}: {de}")
-                    stored_pairs = [(t, i) for t, i in stored_pairs if t in allowed]
+                        if not fact_id:
+                            undeletable.append("<no id>")
+                            continue
+                        try:
+                            await self.memory_client.delete(fact_id)
+                        except Exception as de:
+                            logger.error(
+                                "Rejected fact %s could not be deleted (%s: %s) — it REMAINS in "
+                                "long-term memory",
+                                fact_id,
+                                type(de).__name__,
+                                de,
+                            )
+                            undeletable.append(fact_id)
+
+                    if undeletable:
+                        logger.error(
+                            "%d fact(s) rejected by pre_store_filter are still stored: %s. mem0 "
+                            "returns no id for some writes, and without one there is nothing to "
+                            "delete; remove them out of band.",
+                            len(undeletable),
+                            undeletable,
+                        )
+
+                    still_stored = set(undeletable)
+                    stored_pairs = [
+                        (t, i)
+                        for t, i in stored_pairs
+                        if t in allowed or (i or "<no id>") in still_stored
+                    ]
 
                 if stored_pairs:
                     facts_preview = "; ".join(t[:60] for t, _ in stored_pairs[:3])

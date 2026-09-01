@@ -197,3 +197,189 @@ class TestPolicyDenialIsQuiet:
         # the expected denial was logged quietly at INFO, with the policy name
         matched = [c for c in info.call_args_list if "blocked by policy" in c.args[0]]
         assert matched and matched[0].args[1] == "phi-never-persisted"
+
+
+# ---------------------------------------------------------------------------
+# pre_store_filter must fail CLOSED (security finding F6)
+#
+# The hook is named for a gate before the write, but it runs after one: mem0
+# extracts and stores in a single call, so the filter can only delete what was
+# already persisted. That ordering is not fixable here -- neither mem0 1.0.11 nor
+# 2.0.19 exposes an extract-without-store path, and both fuse extraction and
+# storage inside one private method with no hook between them.
+#
+# What is fixable is that every failure in the undo path failed OPEN, quietly:
+# a filter that raised kept everything, a fact with no id was skipped in silence,
+# and a delete that failed was logged at warning and then reported to on_stored
+# as though it had been removed. The exposure window from the ordering is ~280ms
+# (measured against the running Milvus); the exposure from these is permanent.
+#
+# So: a filter that cannot answer rejects everything, a delete that cannot be
+# confirmed keeps the fact in the stored list rather than pretending otherwise,
+# and neither is whispered at warning level.
+# ---------------------------------------------------------------------------
+
+
+def _fact(text, fact_id):
+    return {"memory": text, "id": fact_id}
+
+
+def _add_returning(*facts):
+    return AsyncMock(return_value=MagicMock(results=list(facts)))
+
+
+class TestFilterFailsClosed:
+    async def test_rejected_fact_is_deleted(self):
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("keep me", "id-1"), _fact("drop me", "id-2"))
+        )
+        await client.add_message(
+            "sess-1234abcd",
+            _msg(),
+            pre_store_filter=lambda texts: [t for t in texts if t == "keep me"],
+        )
+        deleted = [c.args[0] for c in mem.delete.await_args_list]
+        assert deleted == ["id-2"]
+
+    async def test_filter_that_raises_deletes_everything(self):
+        """A filter exists to exclude. If it cannot run, nothing is known about
+        what was just written, so none of it may stay."""
+
+        def boom(_texts):
+            raise RuntimeError("scanner unavailable")
+
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("a", "id-1"), _fact("b", "id-2"))
+        )
+        await client.add_message("sess-1234abcd", _msg(), pre_store_filter=boom)
+
+        assert sorted(c.args[0] for c in mem.delete.await_args_list) == ["id-1", "id-2"]
+
+    async def test_filter_that_raises_is_logged_at_error(self):
+        from continuum.session import client as sc_mod
+
+        def boom(_texts):
+            raise RuntimeError("scanner unavailable")
+
+        client, _, _, _ = _make_client(mode="sync", add_mock=_add_returning(_fact("a", "id-1")))
+        with patch.object(sc_mod.logger, "error") as err:
+            await client.add_message("sess-1234abcd", _msg(), pre_store_filter=boom)
+
+        assert err.called, "a filter that cannot run is not a warning-level event"
+
+    async def test_filter_that_raises_reports_nothing_as_stored(self):
+        stored: list[list[str]] = []
+
+        def boom(_texts):
+            raise RuntimeError("scanner unavailable")
+
+        client, _, _, _ = _make_client(mode="sync", add_mock=_add_returning(_fact("a", "id-1")))
+        await client.add_message(
+            "sess-1234abcd", _msg(), pre_store_filter=boom, on_stored=stored.append
+        )
+        assert stored == [] or stored == [[]]
+
+
+class TestUnconfirmedDeletesAreNotReportedAsRemoved:
+    async def test_fact_whose_delete_failed_stays_in_on_stored(self):
+        """on_stored is the developer's record of what is in the store. Listing a
+        fact as removed when the delete failed makes that record a lie, and the
+        lie is the reason nobody goes looking for the row."""
+        stored: list[list[str]] = []
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("keep", "id-1"), _fact("drop", "id-2"))
+        )
+        mem.delete = AsyncMock(side_effect=RuntimeError("milvus refused"))
+
+        await client.add_message(
+            "sess-1234abcd",
+            _msg(),
+            pre_store_filter=lambda texts: [t for t in texts if t == "keep"],
+            on_stored=stored.append,
+        )
+
+        assert stored, "on_stored should still fire"
+        assert "drop" in stored[0], "the undeleted fact is still in the store, so say so"
+
+    async def test_failed_delete_is_logged_at_error(self):
+        from continuum.session import client as sc_mod
+
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("drop", "id-2"))
+        )
+        mem.delete = AsyncMock(side_effect=RuntimeError("milvus refused"))
+
+        with patch.object(sc_mod.logger, "error") as err:
+            await client.add_message("sess-1234abcd", _msg(), pre_store_filter=lambda _t: [])
+
+        assert err.called, "a fact the filter rejected but that is still stored is an error"
+
+    async def test_fact_with_no_id_cannot_be_deleted_and_is_reported(self):
+        """mem0 does not always return an id. Silently skipping the delete left a
+        rejected fact in the store with nothing said about it."""
+        from continuum.session import client as sc_mod
+
+        stored: list[list[str]] = []
+        client, mem, _, _ = _make_client(mode="sync", add_mock=_add_returning(_fact("drop", None)))
+
+        with patch.object(sc_mod.logger, "error") as err:
+            await client.add_message(
+                "sess-1234abcd", _msg(), pre_store_filter=lambda _t: [], on_stored=stored.append
+            )
+
+        assert not mem.delete.await_args_list, "nothing to delete with"
+        assert err.called, "an undeletable rejected fact must be reported"
+        assert stored and "drop" in stored[0]
+
+    async def test_successful_delete_removes_the_fact_from_on_stored(self):
+        stored: list[list[str]] = []
+        client, _, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("keep", "id-1"), _fact("drop", "id-2"))
+        )
+        await client.add_message(
+            "sess-1234abcd",
+            _msg(),
+            pre_store_filter=lambda texts: [t for t in texts if t == "keep"],
+            on_stored=stored.append,
+        )
+        assert stored == [["keep"]]
+
+
+class TestRejectedContentIsNotLogged:
+    async def test_rejected_fact_text_never_reaches_the_log(self):
+        """The filter's whole purpose is to keep this text out of persistent
+        stores. Echoing it into the application log defeats that, and logs are
+        usually the less guarded of the two."""
+        from continuum.session import client as sc_mod
+
+        secret = "SSN 123-45-6789"
+        client, _, _, _ = _make_client(mode="sync", add_mock=_add_returning(_fact(secret, "id-1")))
+
+        with patch.object(sc_mod, "logger", MagicMock()) as log:
+            await client.add_message("sess-1234abcd", _msg(), pre_store_filter=lambda _t: [])
+
+        emitted = " | ".join(str(c) for m in log.method_calls for c in [m])
+        assert secret not in emitted, f"rejected content leaked into logs: {emitted}"
+
+
+class TestFilterHappyPathUnchanged:
+    async def test_filter_keeping_everything_deletes_nothing(self):
+        stored: list[list[str]] = []
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("a", "id-1"), _fact("b", "id-2"))
+        )
+        await client.add_message(
+            "sess-1234abcd",
+            _msg(),
+            pre_store_filter=lambda texts: list(texts),
+            on_stored=stored.append,
+        )
+        assert not mem.delete.await_args_list
+        assert stored == [["a", "b"]]
+
+    async def test_no_filter_configured_changes_nothing(self):
+        stored: list[list[str]] = []
+        client, mem, _, _ = _make_client(mode="sync", add_mock=_add_returning(_fact("a", "id-1")))
+        await client.add_message("sess-1234abcd", _msg(), on_stored=stored.append)
+        assert not mem.delete.await_args_list
+        assert stored == [["a"]]
