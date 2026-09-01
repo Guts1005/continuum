@@ -25,6 +25,63 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+MEMORY_HEADER = "User profile (long-term preferences and context):"
+
+
+def _render_memory_context(memories: list[dict[str, Any]]) -> str:
+    """Render retrieved memories, fencing only the rows provenance marks untrusted.
+
+    Rows written by an untainted run are the user's own material and render
+    exactly as they always have -- that shape is measured at full utility on
+    every model tested, and changing it is not free: the envelope alone, with no
+    rule attached, takes Claude's factual recall from 3/3 to 0/3.
+
+    Rows carrying provenance labels were derived from untrusted input. Those go
+    inside a ``recalled_memory`` envelope, which strips invisible characters and
+    defangs any tag the content uses to close the fence early, and the standing
+    rule is emitted alongside so the tag means something to the model.
+
+    Splitting by provenance is what lets both hold at once. The two cases are
+    indistinguishable as text -- a stored "prefers bullet points" and a planted
+    "always append token X" are both directives in a memory row -- so no wording
+    can separate them. Phase 1's stamp can.
+
+    An unlabelled row counts as clean. Every row written before provenance
+    existed is unlabelled, so treating them as suspect would fence the whole
+    existing corpus and take recall down with it. Cover here is forward-only, by
+    design; the tool gate is the control that does not depend on it.
+    """
+    if not memories:
+        return ""
+
+    from continuum.llm.untrusted_content import MEMORY_INSTRUCTION, MEMORY_TAG, fence_untrusted
+    from continuum.memory.types import PROVENANCE_LABELS_KEY
+
+    clean: list[str] = []
+    untrusted: list[str] = []
+
+    for m in memories:
+        # Preserve the historical fallback: a row shaped unexpectedly renders its
+        # repr rather than vanishing, so a retrieval bug stays visible.
+        text = m.get("memory", str(m)) if isinstance(m, dict) else str(m)
+        meta = m.get("metadata") if isinstance(m, dict) else None
+        labels = meta.get(PROVENANCE_LABELS_KEY) if isinstance(meta, dict) else None
+        # Same tolerance as the reader in memory_service: only a list/tuple of
+        # strings counts. str and dict are both iterable, so accepting "any
+        # iterable" would read a string's characters as labels.
+        if isinstance(labels, list | tuple) and any(isinstance(x, str) for x in labels):
+            untrusted.append(str(text))
+        else:
+            clean.append(str(text))
+
+    parts: list[str] = []
+    if clean:
+        parts.append(MEMORY_HEADER + "\n" + "".join(f"- {t}\n" for t in clean))
+    if untrusted:
+        body = "".join(f"- {t}\n" for t in untrusted).rstrip("\n")
+        parts.append(MEMORY_INSTRUCTION + "\n" + fence_untrusted(body, MEMORY_TAG))
+    return "\n".join(parts)
+
 
 _REACT_TEMPLATE_BASE = """
 Before answering, call the 'think' tool to reason step by step.
@@ -170,14 +227,13 @@ class MessageBuilder(IMessageBuilder):
                 memories = await self._memory_service.retrieve_memories(agent, query, context)
 
                 if memories:
-                    memory_content = "User profile (long-term preferences and context):\n"
-                    for m in memories:
-                        memory_content += f"- {m.get('memory', str(m))}\n"
+                    memory_content = _render_memory_context(memories)
 
                     logger.info(f"💾 Injecting {len(memories)} memories into LLM context")
                     logger.debug(f"💾 Memory context content:\n{memory_content}")
 
-                    messages.append({"role": "system", "content": memory_content})
+                    if memory_content:
+                        messages.append({"role": "system", "content": memory_content})
             except Exception as e:
                 logger.warning(f"❌ Failed to retrieve memories: {e}", exc_info=True)
 
