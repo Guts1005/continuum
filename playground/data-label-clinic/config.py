@@ -321,6 +321,24 @@ class ClinicConfig:
     # long-term memory holds non-sensitive preferences that must NOT taint a run
     # (otherwise a benign "clinic hours?" turn would taint as soon as any memory
     # exists, and could never write memory again). Left empty on purpose.
+    #
+    # Leaving it empty costs nothing here, because there is a third memory
+    # producer that needs no declaration at all: ROW-level provenance. Whatever
+    # labels a run carries are stamped onto each memory it writes, and recalling
+    # that row re-taints the reading run. Scope provenance answers "is this store
+    # sensitive"; row provenance answers "was this particular fact derived from
+    # untrusted input" -- and only the second can tell a preference the user
+    # really stated from a sentence an attacker planted upstream, since both end
+    # up as rows in the same scope.
+    #
+    # It does not fire in THIS demo, and that is worth understanding rather than
+    # assuming: `phi-never-persisted` denies `memory:*` for a tainted run, so a
+    # PHI run never writes a row for there to be provenance on. That is the
+    # stricter of the two available postures -- "sensitive data never persists".
+    # The looser one, "external data may persist but its origin travels with
+    # it", is what row provenance is for: allow the write, and gate the actions
+    # that recalled content must not reach. Recalled rows that do carry labels
+    # are also fenced in the prompt rather than presented as user profile.
     scope_data_labels: dict[str, set[str]] = field(default_factory=dict)
 
     # Output scanners (SDK hook): run over the final answer before it is returned
