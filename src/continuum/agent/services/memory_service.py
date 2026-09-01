@@ -68,6 +68,64 @@ class MemoryService(IMemoryService):
         """Get memory client."""
         return self._memory_client
 
+    def _warn_if_provenance_undeclared(self, agent: BaseAgent, context: RunContext) -> None:
+        """Say once that the memory-poisoning defences are configured off.
+
+        Every taint producer is gated on a declaration that defaults to empty --
+        ``AgentConfig.tool_data_labels``, ``AgentMemoryConfig.scope_data_labels``,
+        and the run-level seed. With none of them set nothing taints, so memory
+        rows are stamped with nothing, the read path finds every row clean and
+        fences nothing, and the tool gate never matches a label. The machinery is
+        all present and does nothing.
+
+        That is the intended default -- the SDK ships no detector and will not
+        guess which tools return attacker-influenced data, because guessing wrong
+        either gates benign work or gives false assurance. But it fails by doing
+        nothing, which is the failure mode nobody notices, so it is reported the
+        way a URL-derived MCP server name is: name the fields, state what is lost,
+        then stay quiet.
+
+        A tainted run counts as declared: run-level seeding is invisible in the
+        agent config, so labels already present are proof the mechanism is live.
+
+        Once per agent. This runs every turn, and a warning repeated each turn is
+        one people filter out.
+        """
+        if getattr(agent, "_warned_provenance_undeclared", False):
+            return
+
+        mem_cfg = getattr(agent, "memory_config", None)
+        if mem_cfg is None:
+            return
+        if not (
+            getattr(mem_cfg, "search_memories", False) or getattr(mem_cfg, "store_memories", False)
+        ):
+            return  # memory off: nothing to protect, nothing to say
+
+        if getattr(context, "data_labels", None):
+            return  # the run is tainted, so provenance is declared somewhere
+        if getattr(mem_cfg, "scope_data_labels", None):
+            return
+        if getattr(getattr(agent, "config", None), "tool_data_labels", None):
+            return
+
+        try:
+            agent._warned_provenance_undeclared = True  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass  # a frozen/slotted agent just gets the warning again
+
+        logger.warning(
+            f"Agent '{getattr(agent, 'name', '?')}' has long-term memory enabled but declares no "
+            "data provenance, so the memory-poisoning defences are inactive: rows are written "
+            "without provenance, recalled content is never fenced, and no tool call can be gated "
+            "on where its data came from. A fact laundered out of an injected tool result will "
+            "come back indistinguishable from one the user stated. Declare which tools return "
+            "attacker-influenced data via AgentConfig.tool_data_labels "
+            '(e.g. {"fetch_page": {"external"}}), and/or which memory scopes are sensitive via '
+            'AgentMemoryConfig.scope_data_labels (e.g. {"user": {"pii"}}), then add a PolicyStore '
+            "rule denying those labels the actions they must not reach."
+        )
+
     @observe(name="retrieve_memories", capture_output=True)
     async def retrieve_memories(
         self,
@@ -86,6 +144,8 @@ class MemoryService(IMemoryService):
         Returns:
             List of memory dictionaries
         """
+        self._warn_if_provenance_undeclared(agent, context)
+
         if not agent.memory_config.search_memories or not self._memory_client:
             logger.debug(
                 f"💾 Skipping memory search: search_memories={agent.memory_config.search_memories}, "
@@ -245,6 +305,10 @@ class MemoryService(IMemoryService):
             messages: Conversation messages
             context: Run context
         """
+        # Reported here too: a store-only agent never reaches the read path, but
+        # its writes are the ones being stamped, so it has the same gap.
+        self._warn_if_provenance_undeclared(agent, context)
+
         # Memory storage is handled by SessionService.save_messages()
         # This method exists for interface compatibility
         logger.debug("Memory storage is handled by session service during message save")

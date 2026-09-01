@@ -26,6 +26,8 @@ No detector is shipped: tests declare provenance explicitly.
 
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 from continuum.agent.utils.context_utils import create_run_context
@@ -625,3 +627,145 @@ class TestPoisonedMemoryIsDeniedAtTheAction:
         )
         decision = store.check(["refund-agent", *sorted(ctx.data_labels)], "tool:issue_refund")
         assert decision.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# Telling the developer the mechanism is switched off
+#
+# Every producer above is gated on a declaration that defaults to empty:
+# tool_data_labels {}, scope_data_labels {}, and no run-level seed. So in a
+# default deployment nothing taints -- which means memory rows are stamped with
+# nothing, the read path fences nothing, and the tool gate never matches a
+# label. The whole chain is present and inert.
+#
+# That is the intended design (the SDK ships no PII detector and guesses no
+# provenance), but it fails by doing nothing, which is the failure mode that
+# never gets noticed. So say it once, the same way a derived MCP server name is
+# reported: name the fields, state the consequence, and stay quiet afterwards.
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _captured_memory_warnings():
+    """WARNINGs from memory_service (caplog cannot: the parent sets propagate=False)."""
+    messages: list[str] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.WARNING:
+                messages.append(record.getMessage())
+
+    handler = _Collector()
+    lg = logging.getLogger("continuum.agent.services.memory_service")
+    lg.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        lg.removeHandler(handler)
+
+
+def _agent_with(*, tool_labels=None, scope_labels=None, search=True, store=True):
+    from continuum.agent.base import BaseAgent
+    from continuum.agent.config import AgentConfig, AgentMemoryConfig
+
+    return BaseAgent(
+        name="prov-warn-agent",
+        instructions="test",
+        config=AgentConfig(tool_data_labels=tool_labels or {}),
+        memory_config=AgentMemoryConfig(
+            scope_data_labels=scope_labels or {},
+            search_memories=search,
+            store_memories=store,
+        ),
+    )
+
+
+class TestUndeclaredProvenanceIsReported:
+    async def test_warns_when_memory_is_on_and_nothing_is_declared(self):
+        svc = _memory_service(_memory_client())
+        agent = _agent_with()
+        ctx = create_run_context(user_id="u1")
+
+        with _captured_memory_warnings() as warnings:
+            await svc.retrieve_memories(agent, "query", ctx)
+
+        assert warnings, "an inert mechanism must announce itself"
+
+    async def test_warning_names_both_declaration_fields(self):
+        svc = _memory_service(_memory_client())
+        agent = _agent_with()
+        ctx = create_run_context(user_id="u1")
+
+        with _captured_memory_warnings() as warnings:
+            await svc.retrieve_memories(agent, "query", ctx)
+
+        joined = "\n".join(warnings)
+        assert "tool_data_labels" in joined
+        assert "scope_data_labels" in joined
+
+    async def test_warns_only_once_per_agent(self):
+        """This runs every turn; a warning repeated each turn is one people
+        filter out, and then it protects nobody."""
+        svc = _memory_service(_memory_client())
+        agent = _agent_with()
+
+        with _captured_memory_warnings() as warnings:
+            for _ in range(3):
+                await svc.retrieve_memories(agent, "query", create_run_context(user_id="u1"))
+
+        assert len(warnings) == 1
+
+    async def test_silent_when_tool_provenance_is_declared(self):
+        svc = _memory_service(_memory_client())
+        agent = _agent_with(tool_labels={"fetch_page": {"external"}})
+        ctx = create_run_context(user_id="u1")
+
+        with _captured_memory_warnings() as warnings:
+            await svc.retrieve_memories(agent, "query", ctx)
+
+        assert warnings == []
+
+    async def test_silent_when_scope_provenance_is_declared(self):
+        svc = _memory_service(_memory_client())
+        agent = _agent_with(scope_labels={"user": {"pii"}})
+        ctx = create_run_context(user_id="u1")
+
+        with _captured_memory_warnings() as warnings:
+            await svc.retrieve_memories(agent, "query", ctx)
+
+        assert warnings == []
+
+    async def test_silent_when_the_run_is_already_tainted(self):
+        """Run-level seeding is a third declaration site and is invisible in the
+        agent config, so a tainted run is proof the mechanism is live."""
+        svc = _memory_service(_memory_client())
+        agent = _agent_with()
+        ctx = create_run_context(user_id="u1", data_labels={"external"})
+
+        with _captured_memory_warnings() as warnings:
+            await svc.retrieve_memories(agent, "query", ctx)
+
+        assert warnings == []
+
+    async def test_silent_when_memory_is_off_entirely(self):
+        """Nothing to protect, so nothing to say."""
+        svc = _memory_service(_memory_client())
+        agent = _agent_with(search=False, store=False)
+        ctx = create_run_context(user_id="u1")
+
+        with _captured_memory_warnings() as warnings:
+            await svc.retrieve_memories(agent, "query", ctx)
+
+        assert warnings == []
+
+    async def test_store_only_agent_is_still_warned(self):
+        """Writes are stamped too, so a store-only agent has the same gap even
+        though it never reaches the read path."""
+        svc = _memory_service(_memory_client())
+        agent = _agent_with(search=False, store=True)
+        ctx = create_run_context(user_id="u1")
+
+        with _captured_memory_warnings() as warnings:
+            await svc.store_memories(agent, [{"role": "user", "content": "x"}], ctx)
+
+        assert warnings, "the write path has the same undeclared-provenance gap"
