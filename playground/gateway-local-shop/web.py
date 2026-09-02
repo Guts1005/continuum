@@ -385,7 +385,7 @@ function closeMemoryPanel() {
 async function approveMemory(id, btn) {
   // Spell out the consequence: clearing the label also stops this row taints
   // gating actions, and the reviewer is the one taking that on.
-  if (!confirm('Mark this memory as reviewed?\n\nIt will no longer be treated as untrusted, and will stop blocking gated actions for turns that recall it.')) return;
+  if (!confirm('Mark this memory as reviewed? It will no longer be treated as untrusted, and will stop blocking gated actions for turns that recall it.')) return;
   btn.disabled = true; btn.textContent = '...';
   const res = await fetch('/memory/approve', {
     method: 'POST', headers: {'Content-Type': 'application/json'},

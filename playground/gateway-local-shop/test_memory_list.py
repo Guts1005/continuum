@@ -204,3 +204,43 @@ class TestApproveEndpoint:
         data = await web.approve_memory(web.ApproveMemoryRequest(memory_id="x", user_id="tom"))
 
         assert data["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# The page's JavaScript has to parse
+#
+# HTML_PAGE is a plain (non-raw) Python triple-quoted string, so a backslash
+# escape written for JavaScript is consumed by Python first: "\\n" in the JS
+# source arrives as a real newline, and a real newline inside a single-quoted JS
+# string is a syntax error. One such error kills the WHOLE script block, so
+# every handler on the page silently ceases to exist -- the page still renders,
+# and clicking Login does nothing at all. Nothing was checking this, which is
+# exactly how it shipped.
+# ---------------------------------------------------------------------------
+
+
+class TestPageScriptParses:
+    def test_inline_script_is_valid_javascript(self):
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not available to parse the page script")
+
+        import web
+
+        blocks = re.findall(r"<script[^>]*>(.*?)</script>", web.HTML_PAGE, re.S)
+        assert blocks, "the page is expected to carry an inline script"
+
+        for i, block in enumerate(blocks):
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+                fh.write(block)
+                path = fh.name
+            result = subprocess.run([node, "--check", path], capture_output=True, text=True)
+            assert result.returncode == 0, (
+                f"script block {i} does not parse, so every handler on the page is "
+                f"undefined:\n{result.stderr}"
+            )
