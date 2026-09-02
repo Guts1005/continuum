@@ -94,6 +94,11 @@ class TestSyncMode:
         # by pinning the setting the field reads from.
         with patch("continuum.session.config.settings") as mock_settings:
             mock_settings.session_memory_write_mode = "background"
+            # Patching the whole settings object turns every unpinned field into
+            # a MagicMock, and pydantic does not validate default_factory values —
+            # so the session-id-secret validator would otherwise be handed one.
+            mock_settings.session_hash_ids = False
+            mock_settings.session_id_secret = None
             assert SessionConfig().memory_write_mode == "background"
 
     async def test_sync_awaits_memory_add_before_return(self):

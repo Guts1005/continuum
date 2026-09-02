@@ -168,6 +168,9 @@ class TestOwnershipDecision:
 
 
 def _client(mode: str = "enforce", **kw) -> SessionClient:
+    # hash_session_ids is pinned rather than inherited: these tests are about
+    # ownership, and a developer's local .env must not change what they exercise.
+    kw.setdefault("hash_session_ids", False)
     cfg = SessionConfig(enabled=True, provider="memory", session_ownership=mode, **kw)
     client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
     client.set_provider(MemorySessionProvider(cfg))
@@ -243,7 +246,7 @@ class TestSessionClientGate:
             provider="memory",
             session_ownership="enforce",
             hash_session_ids=True,
-            session_id_secret="deployment-secret-value",
+            session_id_secret="d27d3f15bdd2236ac32c8333ddc38b0546f49a7db0276293b93ae4174d597641",
         )
         client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
         client.set_provider(MemorySessionProvider(cfg))
@@ -263,7 +266,7 @@ class TestSessionClientGate:
         adds nothing the caller did not already hold — but the scheme leaks
         regardless, which is what Fix A removes.
         """
-        client = _client()
+        client = _client(hash_session_ids=False)
         sid = await _seed_owned_session(client, owner="alice")
         assert "alice" in sid  # the id itself is the disclosure
 
@@ -377,7 +380,7 @@ class TestFixesCompose:
             provider="memory",
             session_ownership="enforce",
             hash_session_ids=True,
-            session_id_secret="deployment-secret-value",
+            session_id_secret="d27d3f15bdd2236ac32c8333ddc38b0546f49a7db0276293b93ae4174d597641",
         )
         client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
         client.set_provider(MemorySessionProvider(cfg))
@@ -437,7 +440,7 @@ class TestSecureByDefault:
 class TestSecureByDefaultBehaviour:
     def _default_client(self) -> SessionClient:
         """A client on shipped defaults — nothing about ownership configured."""
-        cfg = SessionConfig(enabled=True, provider="memory")
+        cfg = SessionConfig(enabled=True, provider="memory", hash_session_ids=False)
         client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
         client.set_provider(MemorySessionProvider(cfg))
         client._initialized = True

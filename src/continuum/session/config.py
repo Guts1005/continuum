@@ -9,6 +9,10 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from continuum.config import settings
+from continuum.security.secrets_guard import (
+    MIN_OFFLINE_SECRET_LENGTH,
+    enforce_credential,
+)
 from continuum.session.exceptions import SessionConfigurationError
 
 # Safe minimum pool size — a configured value below this is raised to it so the
@@ -247,7 +251,12 @@ class SessionConfig(BaseModel):
         security control reporting 'enabled' while doing nothing is the exact
         failure this whole change exists to remove, so it fails closed instead.
         """
-        if self.hash_session_ids and not (self.session_id_secret or "").strip():
+        if not self.hash_session_ids:
+            # The value is unused, so it cannot be a vulnerability. Refusing to
+            # start over a weak-but-inert secret would be a false alarm.
+            return self
+
+        if not (self.session_id_secret or "").strip():
             raise SessionConfigurationError(
                 "hash_session_ids=True requires session_id_secret (SESSION_ID_SECRET). "
                 "A plain hash of a guessable input is still guessable, so the secret "
@@ -255,6 +264,28 @@ class SessionConfig(BaseModel):
                 "change how keys look. Set the same value in every process and keep "
                 "it stable across restarts; changing it re-derives every session id."
             )
+
+        # Present but weak. Handed to the same guard that protects the Redis and
+        # vector-store credentials, so this secret fails the way the others do —
+        # including the CONTINUUM_ALLOW_INSECURE escape hatch for local work.
+        #
+        # A length floor applies here and not to those: a Redis password is
+        # guessed through the network, where the server slows the attacker down.
+        # This one is guessed offline, because every user of the system holds a
+        # matched pair (their own user id -> their own session id) and can grind
+        # candidates locally with no rate limit and no logs. Recovering it yields
+        # every user's session id, so anything memorable is fatal rather than
+        # merely unwise.
+        #
+        # Note the escape hatch deliberately does NOT reach the check above: a
+        # weak secret is a downgrade an operator may knowingly accept, while an
+        # absent one leaves nothing to key the HMAC with.
+        enforce_credential(
+            service="Session id hashing",
+            credential=self.session_id_secret,
+            env_var="SESSION_ID_SECRET",
+            min_length=MIN_OFFLINE_SECRET_LENGTH,
+        )
         return self
 
     @property
