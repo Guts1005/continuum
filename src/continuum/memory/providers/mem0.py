@@ -465,9 +465,17 @@ class Mem0Provider(BaseMemoryProvider):
         data: str,
         *,
         custom_prompt: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> MemoryEntry:
         """
         Update a memory using mem0's Memory.update() via asyncio.to_thread().
+
+        ``metadata`` REPLACES the row's payload rather than merging into it.
+        mem0's docstring says the opposite -- "existing metadata fields not
+        specified here will be preserved" -- but ``_update_memory`` rebuilds the
+        payload from what it is given and re-preserves only user_id, agent_id,
+        run_id, actor_id and role. Verified against a live Milvus. Callers should
+        read the row and pass its full metadata back with their edit applied.
 
         See: https://docs.mem0.ai/open-source/features/custom-update-memory-prompt
         """
@@ -477,6 +485,9 @@ class Mem0Provider(BaseMemoryProvider):
             "memory_id": memory_id,
             "data": data,
         }
+
+        if metadata is not None:
+            kwargs["metadata"] = metadata
 
         # Custom update prompt
         if custom_prompt:

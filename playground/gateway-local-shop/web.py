@@ -26,7 +26,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from continuum import LogLevel, setup_logging
-from continuum.memory.types import PROVENANCE_LABELS_KEY
+from continuum.memory.types import PROVENANCE_LABELS_KEY, REVIEWED_KEY
 
 setup_logging(level=LogLevel.INFO)
 
@@ -68,6 +68,11 @@ class ClearMemoryRequest(BaseModel):
 
 class DeleteMemoryRequest(BaseModel):
     memory_id: str
+
+
+class ApproveMemoryRequest(BaseModel):
+    memory_id: str
+    user_id: str
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -135,6 +140,11 @@ async def list_memories(user_id: str):
                     "labels": (e.metadata or {}).get(PROVENANCE_LABELS_KEY)
                     if isinstance(e.metadata, dict)
                     else None,
+                    # Mutually exclusive with `labels` by construction:
+                    # mark_reviewed removes the label as it writes the record.
+                    "reviewed": (e.metadata or {}).get(REVIEWED_KEY)
+                    if isinstance(e.metadata, dict)
+                    else None,
                 }
                 for e in entries
             ],
@@ -152,6 +162,31 @@ async def delete_memory(req: DeleteMemoryRequest):
         await client.delete(req.memory_id)
         return {"success": True}
     except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/memory/approve")
+async def approve_memory(req: ApproveMemoryRequest):
+    """Human review: clear a row's provenance label and record who cleared it.
+
+    The third option between deleting a labelled row and living with the gate.
+    Provenance is coarse -- a useful fact learned from a fetched page is stamped
+    the same as a planted instruction -- so a person has to be able to say "I
+    looked at this one, it is fine".
+
+    Note the reviewer here is the end user, which suits a demo. A real
+    deployment wants a staff identity: the person whose session was poisoned is
+    the wrong person to clear the label on it.
+    """
+    client = _get_memory_client()
+    if not client:
+        return {"success": False, "error": "Memory not available"}
+    try:
+        await client.mark_reviewed(req.memory_id, reviewer=req.user_id)
+        return {"success": True}
+    except Exception as e:
+        # Reported, not raised: the panel renders data["error"], while a 500
+        # would leave the reviewer unsure whether the decision was recorded.
         return {"success": False, "error": str(e)}
 
 
@@ -320,16 +355,45 @@ async function openMemoryPanel() {
     list.innerHTML = '<p style="color:#999;">No memories found.</p>';
     return;
   }
-  list.innerHTML = data.memories.map(m => `
-    <div style="display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid #f0f0f0;">
+  // Labelled rows first: they are the ones needing a decision, and a reviewer
+  // should not have to scroll past clean rows to find them.
+  const rows = [...data.memories].sort((a, b) => (b.labels ? 1 : 0) - (a.labels ? 1 : 0));
+  list.innerHTML = rows.map(m => {
+    const tainted = m.labels && m.labels.length;
+    const badge = tainted
+      ? `<span title="derived from content the agent read from an external source" style="background:#fdecea; color:#c0392b; border:1px solid #f5c6c2; border-radius:3px; padding:1px 6px; font-size:11px; white-space:nowrap;">⚠ ${m.labels.join(', ')}</span>`
+      : (m.reviewed
+        ? `<span title="cleared by ${m.reviewed.by} on ${m.reviewed.at}" style="background:#eaf6ec; color:#1e7e34; border:1px solid #c3e6cb; border-radius:3px; padding:1px 6px; font-size:11px; white-space:nowrap;">✓ reviewed</span>`
+        : '');
+    const approve = tainted
+      ? `<button onclick="approveMemory('${m.id}', this)" style="padding:4px 10px; background:#1e7e34; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">Approve</button>`
+      : '';
+    return `
+    <div style="display:flex; align-items:center; gap:8px; padding:8px 0; border-bottom:1px solid #f0f0f0;">
+      ${badge}
       <span style="flex:1; font-size:14px;">${m.text}</span>
+      ${approve}
       <button onclick="deleteMemory('${m.id}', this)" style="padding:4px 10px; background:#c0392b; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">Delete</button>
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
 }
 
 function closeMemoryPanel() {
   document.getElementById('memory-overlay').style.display = 'none';
+}
+
+async function approveMemory(id, btn) {
+  // Spell out the consequence: clearing the label also stops this row taints
+  // gating actions, and the reviewer is the one taking that on.
+  if (!confirm('Mark this memory as reviewed?\n\nIt will no longer be treated as untrusted, and will stop blocking gated actions for turns that recall it.')) return;
+  btn.disabled = true; btn.textContent = '...';
+  const res = await fetch('/memory/approve', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({memory_id: id, user_id: currentUserId})
+  });
+  const data = await res.json();
+  if (data.success) { openMemoryPanel(); }
+  else { btn.disabled = false; btn.textContent = 'Approve'; alert(data.error); }
 }
 
 async function deleteMemory(memoryId, btn) {

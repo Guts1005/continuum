@@ -115,4 +115,92 @@ class TestListingToleratesOddMetadata:
             ]
         )
 
-        assert data["memories"][0] == {"id": "id-6", "text": "text", "labels": ["pii"]}
+        assert data["memories"][0] == {
+            "id": "id-6",
+            "text": "text",
+            "labels": ["pii"],
+            "reviewed": None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Human review from the memory panel (security finding F6)
+#
+# Provenance is coarse by design, so the panel accumulates rows that are
+# labelled and genuinely fine -- "Jack is a student", learned from a page the
+# agent fetched. Deleting them loses real information; leaving them keeps the
+# action gate firing forever. Approve is the third option, and it records who
+# decided rather than quietly erasing the label.
+# ---------------------------------------------------------------------------
+
+REVIEWED = "_reviewed"
+
+
+class TestListingSurfacesReviewRecords:
+    async def test_reviewed_row_reports_its_record(self, listing):
+        record = {"by": "tom", "at": "2026-09-02T10:00:00", "cleared": ["external"]}
+        data = await listing([_entry("id-1", "Jack is a student", {REVIEWED: record})])
+
+        assert data["memories"][0]["reviewed"] == record
+
+    async def test_unreviewed_row_reports_none(self, listing):
+        data = await listing([_entry("id-2", "name is Tom", None)])
+
+        assert data["memories"][0]["reviewed"] is None
+
+    async def test_a_reviewed_row_carries_no_labels(self, listing):
+        """The two fields are mutually exclusive by construction: mark_reviewed
+        removes the label as it writes the record. The panel renders on that."""
+        record = {"by": "tom", "at": "2026-09-02T10:00:00", "cleared": ["external"]}
+        data = await listing([_entry("id-3", "Jack is a student", {REVIEWED: record})])
+
+        assert data["memories"][0]["labels"] is None
+        assert data["memories"][0]["reviewed"] is not None
+
+
+class TestApproveEndpoint:
+    @pytest.fixture
+    def approve(self, monkeypatch):
+        import web
+
+        async def _call(*, mark=None, user_id="tom"):
+            client = SimpleNamespace(
+                mark_reviewed=mark or AsyncMock(return_value=None), is_enabled=True
+            )
+            monkeypatch.setattr(web, "_get_memory_client", lambda: client)
+            req = web.ApproveMemoryRequest(memory_id="id-1", user_id=user_id)
+            return await web.approve_memory(req), client
+
+        return _call
+
+    async def test_marks_the_row_reviewed(self, approve):
+        data, client = await approve()
+
+        assert data["success"] is True
+        client.mark_reviewed.assert_awaited_once()
+
+    async def test_records_the_reviewer(self, approve):
+        """Attribution is the point of the record, so the caller's identity has
+        to reach it. In this demo that is the end user; a real deployment wants
+        a staff identity, since the user whose session was poisoned should not
+        be the one clearing the label."""
+        _, client = await approve(user_id="alice")
+
+        assert client.mark_reviewed.await_args.kwargs["reviewer"] == "alice"
+
+    async def test_failure_is_reported_not_raised(self, approve):
+        """The panel shows data["error"]; an exception would surface as a 500
+        and leave the reviewer unsure whether the decision was recorded."""
+        failing = AsyncMock(side_effect=RuntimeError("row vanished"))
+        data, _ = await approve(mark=failing)
+
+        assert data["success"] is False
+        assert "row vanished" in data["error"]
+
+    async def test_no_memory_client_is_reported(self, monkeypatch):
+        import web
+
+        monkeypatch.setattr(web, "_get_memory_client", lambda: None)
+        data = await web.approve_memory(web.ApproveMemoryRequest(memory_id="x", user_id="tom"))
+
+        assert data["success"] is False

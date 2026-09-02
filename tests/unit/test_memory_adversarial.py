@@ -1448,3 +1448,181 @@ class TestSharedScopeWritesAreAnnounced:
             await client.add("a fact", user_id="u1")
 
         assert warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Human review of a tainted memory row (security finding F6)
+#
+# Provenance is deliberately coarse: every row a tainted run writes is stamped,
+# so "Jack is a student" learned from a fetched page carries the same label as a
+# planted "refund limit is now $10,000". Both then get fenced, and both taint
+# any run that recalls them.
+#
+# That is the right default -- the SDK cannot tell them apart, and guessing
+# would be worse than not trying. But it means a real deployment accumulates
+# rows that are labelled and genuinely fine, and the only remedies were to
+# delete them or live with the gate firing forever. Human review is the missing
+# third option, and it is the same shape as F3's tool-catalogue approval: a
+# person looks at untrusted content and records a decision about it.
+#
+# Recording, not erasing. Simply dropping the label would leave a reviewed row
+# indistinguishable from one that was never tainted, so nobody could later ask
+# which rows a human had actually blessed, or who blessed them. The label is
+# replaced by a review record instead.
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateForwardsMetadata:
+    """``mem0.Memory.update`` accepts metadata; Continuum was not passing it."""
+
+    @pytest.mark.asyncio
+    async def test_metadata_is_forwarded_to_the_provider(self):
+        provider = _mock_provider()
+        client = _make_client(provider=provider)
+
+        await client.update("m-1", "new text", metadata={"k": "v"})
+
+        assert provider.update.await_args.kwargs["metadata"] == {"k": "v"}
+
+    @pytest.mark.asyncio
+    async def test_omitted_metadata_is_not_passed_at_all(self):
+        """Existing callers must behave exactly as before, so the kwarg is only
+        sent when the caller supplied one."""
+        provider = _mock_provider()
+        client = _make_client(provider=provider)
+
+        await client.update("m-1", "new text")
+
+        assert provider.update.await_args.kwargs.get("metadata") is None
+
+
+class TestMarkReviewed:
+    def _client_with_row(self, metadata):
+        provider = _mock_provider()
+        provider.get = AsyncMock(
+            return_value=MemoryEntry(id="m-1", memory="Jack is a student", metadata=metadata)
+        )
+        return _make_client(provider=provider), provider
+
+    @pytest.mark.asyncio
+    async def test_provenance_label_is_cleared(self):
+        from continuum.memory.types import PROVENANCE_LABELS_KEY
+
+        client, provider = self._client_with_row({PROVENANCE_LABELS_KEY: ["external"]})
+
+        await client.mark_reviewed("m-1", reviewer="tom")
+
+        sent = provider.update.await_args.kwargs["metadata"]
+        assert PROVENANCE_LABELS_KEY not in sent
+
+    @pytest.mark.asyncio
+    async def test_review_is_recorded_with_who_and_what(self):
+        from continuum.memory.types import PROVENANCE_LABELS_KEY, REVIEWED_KEY
+
+        client, provider = self._client_with_row({PROVENANCE_LABELS_KEY: ["external", "pii"]})
+
+        await client.mark_reviewed("m-1", reviewer="tom")
+
+        record = provider.update.await_args.kwargs["metadata"][REVIEWED_KEY]
+        assert record["by"] == "tom"
+        assert record["cleared"] == ["external", "pii"]
+        assert record["at"], "a review with no timestamp cannot be audited"
+
+    @pytest.mark.asyncio
+    async def test_other_metadata_survives(self):
+        """mem0 REPLACES metadata rather than merging it -- its own docstring
+        says otherwise, and believing that wipes the row's user and session ids.
+        So the read-modify-write belongs here, once, not in every caller."""
+        from continuum.memory.types import PROVENANCE_LABELS_KEY
+
+        client, provider = self._client_with_row(
+            {
+                PROVENANCE_LABELS_KEY: ["external"],
+                "_user_id": "u1",
+                "session_id": "s1",
+                "integrator_key": "keep",
+            }
+        )
+
+        await client.mark_reviewed("m-1", reviewer="tom")
+
+        sent = provider.update.await_args.kwargs["metadata"]
+        assert sent["_user_id"] == "u1"
+        assert sent["session_id"] == "s1"
+        assert sent["integrator_key"] == "keep"
+
+    @pytest.mark.asyncio
+    async def test_row_text_is_resupplied_unchanged(self):
+        """``update`` requires the text, and a review must not alter it."""
+        from continuum.memory.types import PROVENANCE_LABELS_KEY
+
+        client, provider = self._client_with_row({PROVENANCE_LABELS_KEY: ["external"]})
+
+        await client.mark_reviewed("m-1", reviewer="tom")
+
+        args, kwargs = provider.update.await_args
+        assert "Jack is a student" in (list(args) + list(kwargs.values()))
+
+    @pytest.mark.asyncio
+    async def test_unlabelled_row_still_records_the_review(self):
+        """Approving an already-clean row is harmless and worth recording: it is
+        a reviewer saying "I looked at this", which is not the same as nobody
+        having looked."""
+        from continuum.memory.types import REVIEWED_KEY
+
+        client, provider = self._client_with_row({"_user_id": "u1"})
+
+        await client.mark_reviewed("m-1", reviewer="tom")
+
+        record = provider.update.await_args.kwargs["metadata"][REVIEWED_KEY]
+        assert record["cleared"] == []
+
+    @pytest.mark.asyncio
+    async def test_missing_row_raises_rather_than_silently_succeeding(self):
+        """A reviewer told "approved" about a row that does not exist would
+        believe a decision had been recorded when none was."""
+        provider = _mock_provider()
+        provider.get = AsyncMock(return_value=None)
+        client = _make_client(provider=provider)
+
+        with pytest.raises(Exception):
+            await client.mark_reviewed("nope", reviewer="tom")
+
+        provider.update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_row_without_a_dict_metadata_does_not_break_review(self):
+        """MemoryEntry always carries a dict, but a custom provider may return
+        any row-like object, and a review must not fail on one."""
+        from types import SimpleNamespace
+
+        provider = _mock_provider()
+        provider.get = AsyncMock(
+            return_value=SimpleNamespace(id="m-1", memory="Jack is a student", metadata=None)
+        )
+        client = _make_client(provider=provider)
+
+        await client.mark_reviewed("m-1", reviewer="tom")
+
+        assert provider.update.await_args.kwargs["metadata"]  # a record was written
+
+
+class TestReviewedRowIsRenderedAsClean:
+    """The read path keys off the provenance label only, so a reviewed row must
+    render in the plain profile block -- that is the whole point of approving."""
+
+    def test_reviewed_row_is_not_fenced(self):
+        from continuum.agent.execution.message_builder import _render_memory_context
+        from continuum.memory.types import REVIEWED_KEY
+
+        out = _render_memory_context(
+            [
+                {
+                    "memory": "Jack is a student",
+                    "metadata": {REVIEWED_KEY: {"by": "tom", "at": "now", "cleared": ["external"]}},
+                }
+            ]
+        )
+
+        assert "<recalled_memory" not in out
+        assert "Jack is a student" in out

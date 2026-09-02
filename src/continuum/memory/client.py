@@ -8,6 +8,7 @@ for actual memory operations.
 import asyncio
 import threading
 from collections.abc import Coroutine
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from continuum.llm.untrusted_content import strip_hidden_chars
@@ -22,6 +23,7 @@ from continuum.memory.providers import create_provider, list_providers
 from continuum.memory.scopes import MemoryScope
 from continuum.memory.types import (
     PROVENANCE_LABELS_KEY,
+    REVIEWED_KEY,
     MemoryAddResult,
     MemoryEntry,
     MemoryMetadata,
@@ -550,6 +552,7 @@ class MemoryClient:
         data: str,
         *,
         custom_prompt: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> MemoryEntry:
         """
         Update a specific memory.
@@ -558,12 +561,75 @@ class MemoryClient:
             memory_id: The ID of the memory to update
             data: New data for the memory
             custom_prompt: Custom prompt for memory update
+            metadata: Replacement metadata for the row. REPLACES rather than
+                merges: mem0's own docstring claims unspecified fields are
+                preserved, and they are not -- it rebuilds the payload from what
+                you pass, re-preserving only a fixed set (user_id, agent_id,
+                run_id, actor_id, role) and dropping everything else, including
+                Continuum's own ``_user_id``/``session_id``. So read the row and
+                pass its whole metadata back with your edit applied. For the
+                common case of clearing provenance after review, use
+                :meth:`mark_reviewed`, which does that for you.
 
         Returns:
             Updated MemoryEntry.
         """
         self._ensure_enabled()
-        return await self._provider.update(memory_id, data, custom_prompt=custom_prompt)
+        kwargs: dict[str, Any] = {"custom_prompt": custom_prompt}
+        # Only forward when supplied: passing metadata=None would still be a
+        # replacement, wiping the row's payload for every existing caller.
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        return await self._provider.update(memory_id, data, **kwargs)
+
+    async def mark_reviewed(self, memory_id: str, *, reviewer: str) -> MemoryEntry:
+        """Record that a person reviewed a tainted row, clearing its provenance.
+
+        Provenance labelling is deliberately coarse: every row written by a
+        tainted run is stamped, so a useful fact picked up from a fetched page
+        carries the same label as a planted instruction. The SDK cannot tell them
+        apart and does not try. This is the operation that lets a person who can.
+
+        The label is replaced by a review record rather than deleted, so a
+        blessed row stays distinguishable from one nobody ever looked at, and the
+        decision keeps an owner. Once cleared, the row renders in the plain
+        profile block and no longer taints runs that recall it -- which also
+        means it stops denying whatever actions that label was gating. That is
+        the reviewer's call to make, and worth surfacing to them before they
+        make it.
+
+        Args:
+            memory_id: Row to mark.
+            reviewer: Who reviewed it. Recorded verbatim for audit; in a real
+                deployment this should be a staff identity, not the end user
+                whose session may itself have been poisoned.
+
+        Returns:
+            The updated MemoryEntry.
+
+        Raises:
+            MemoryNotFoundError: If no such row exists -- telling a reviewer
+                "approved" about a row that is not there would report a decision
+                that was never recorded.
+        """
+        self._ensure_enabled()
+
+        entry = await self._provider.get(memory_id)
+        if entry is None:
+            from continuum.memory.exceptions import MemoryNotFoundError
+
+            raise MemoryNotFoundError(f"No memory with id {memory_id!r} to review")
+
+        existing = entry.metadata if isinstance(entry.metadata, dict) else {}
+        metadata = dict(existing)
+        cleared = metadata.pop(PROVENANCE_LABELS_KEY, None)
+        metadata[REVIEWED_KEY] = {
+            "by": reviewer,
+            "at": datetime.now(UTC).isoformat(),
+            "cleared": sorted(cleared) if isinstance(cleared, list | tuple) else [],
+        }
+
+        return await self.update(memory_id, entry.memory, metadata=metadata)
 
     async def history(self, memory_id: str) -> list[dict[str, Any]]:
         """

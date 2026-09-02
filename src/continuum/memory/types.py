@@ -28,6 +28,25 @@ rows in the same scope. The row's own provenance can.
 """
 
 
+REVIEWED_KEY = "_reviewed"
+"""Metadata key recording that a person reviewed a tainted row (finding F6).
+
+Written by :meth:`MemoryClient.mark_reviewed` in place of
+:data:`PROVENANCE_LABELS_KEY`, as ``{"by": ..., "at": ..., "cleared": [...]}``.
+
+A record rather than an erasure. Provenance is deliberately coarse -- every row
+a tainted run writes is stamped, so a useful fact learned from a fetched page
+carries the same label as a planted instruction -- which means a real deployment
+accumulates labelled rows that are genuinely fine. Clearing the label outright
+would leave those indistinguishable from rows that were never tainted, so nobody
+could later ask which a human had actually blessed, or who blessed them. Same
+reasoning as the tool-catalogue approval in F3: the decision is the artifact.
+
+The read path keys off ``PROVENANCE_LABELS_KEY`` alone, so a reviewed row renders
+in the plain profile block and no longer taints the runs that recall it.
+"""
+
+
 class MemoryMetadata(BaseModel):
     """Metadata for a memory entry."""
 
