@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from continuum import LogLevel, setup_logging
 from continuum.memory.types import PROVENANCE_LABELS_KEY, REVIEWED_KEY
+from continuum.session import bind_principal
 
 setup_logging(level=LogLevel.INFO)
 
@@ -54,6 +55,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# Sessions record an owner, and the framework will not load or save one unless
+# the caller says who it is. The application binds that, at the boundary where it
+# would normally have just authenticated the request.
+#
+# NOTE FOR ANYONE COPYING THIS: `req.user_id` is typed into a box in the browser.
+# It is NOT a verified identity, and binding it here is only defensible because
+# this is a local single-user demo with no login. A real deployment must bind an
+# id it derived from a credential it checked — otherwise the ownership check
+# compares an attacker-supplied value against itself and protects nothing:
+#
+#     user = verify_jwt(request.headers["Authorization"])
+#     with bind_principal(user.id):
+#         ...
 
 
 class ChatRequest(BaseModel):
@@ -85,9 +101,10 @@ async def chat(req: ChatRequest):
     if not _agent or not _agent._initialized:
         msg = f"Agent not connected to MCP server. {_init_error or 'Start the MCP server with: python server.py'}"
         return {"response": msg}
-    response = await _agent.chat(
-        req.message, user_id=req.user_id, conversation_id=req.conversation_id
-    )
+    with bind_principal(req.user_id):
+        response = await _agent.chat(
+            req.message, user_id=req.user_id, conversation_id=req.conversation_id
+        )
     return {"response": response}
 
 
@@ -100,8 +117,19 @@ async def chat_stream(req: ChatRequest):
             yield f"data: {json.dumps({'type': 'error', 'error': msg})}\n\n"
 
         return StreamingResponse(error_gen(), media_type="text/event-stream")
+
+    async def bound_stream():
+        # The binding has to live INSIDE the generator: StreamingResponse
+        # consumes it after this handler has already returned, so a `with` around
+        # the call would have exited before a single chunk was produced.
+        with bind_principal(req.user_id):
+            async for chunk in _agent.chat_stream(
+                req.message, user_id=req.user_id, conversation_id=req.conversation_id
+            ):
+                yield chunk
+
     return StreamingResponse(
-        _agent.chat_stream(req.message, user_id=req.user_id, conversation_id=req.conversation_id),
+        bound_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
