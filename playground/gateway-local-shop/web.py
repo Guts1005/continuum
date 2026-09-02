@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from continuum import LogLevel, setup_logging
+from continuum.memory.types import PROVENANCE_LABELS_KEY
 
 setup_logging(level=LogLevel.INFO)
 
@@ -115,7 +116,29 @@ async def list_memories(user_id: str):
         return {"success": False, "error": "Memory not available"}
     try:
         entries = await client.get_all(user_id=user_id)
-        return {"success": True, "memories": [{"id": e.id, "text": e.memory} for e in entries]}
+        # `labels` is the provenance stamp: the taint the run carried when this
+        # row was written, so a fact laundered out of an injected tool result is
+        # distinguishable from one the user actually stated. That difference is
+        # invisible in the text -- both are just sentences -- so without it a
+        # reviewer cleaning up poisoned memory has nothing to go on.
+        #
+        # None, not [], for an unstamped row: everything written before
+        # provenance existed is unlabelled, which is not the same as labelled
+        # with nothing. Only this one key is surfaced; the rest of a row's
+        # metadata holds session and user ids this listing need not expose.
+        return {
+            "success": True,
+            "memories": [
+                {
+                    "id": e.id,
+                    "text": e.memory,
+                    "labels": (e.metadata or {}).get(PROVENANCE_LABELS_KEY)
+                    if isinstance(e.metadata, dict)
+                    else None,
+                }
+                for e in entries
+            ],
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
