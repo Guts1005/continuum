@@ -375,3 +375,51 @@ class TestSecretStrength:
         monkeypatch.delenv(ALLOW_INSECURE_ENV, raising=False)
         cfg = SessionConfig(hash_session_ids=False, session_id_secret="abc")
         assert cfg.active_session_id_secret is None
+
+
+class TestEnvTemplatePlaceholder:
+    """The shipped template must not hand anyone a working weak secret.
+
+    A placeholder is only safe if the code refuses it. Left unchecked, the two
+    failure modes are: a value copied verbatim into production (every such
+    deployment sharing one secret that is readable in the repository), or an
+    inline comment that python-dotenv parses as the value itself. Both have
+    already happened once here, so the template's own value is asserted against
+    the guard rather than trusted to stay sensible.
+    """
+
+    @staticmethod
+    def _template_value() -> str | None:
+        from dotenv import dotenv_values
+
+        return dotenv_values(".env.template").get("SESSION_ID_SECRET")
+
+    def test_the_template_ships_a_placeholder(self):
+        value = self._template_value()
+        assert value, "SESSION_ID_SECRET must carry a placeholder, not be blank"
+
+    def test_the_shipped_placeholder_is_refused_at_startup(self, monkeypatch):
+        """Copy the template, enable hashing, and the app must refuse to start."""
+        from continuum.exceptions import InsecureConfigurationError
+        from continuum.security.secrets_guard import ALLOW_INSECURE_ENV
+
+        monkeypatch.delenv(ALLOW_INSECURE_ENV, raising=False)
+        with pytest.raises(InsecureConfigurationError):
+            SessionConfig(hash_session_ids=True, session_id_secret=self._template_value())
+
+    def test_the_template_does_not_enable_hashing(self):
+        """Shipping hash_session_ids=true alongside a rejected placeholder would
+        fail every fresh checkout at startup."""
+        from dotenv import dotenv_values
+
+        assert dotenv_values(".env.template").get("SESSION_HASH_IDS") == "false"
+
+    def test_no_value_in_the_template_is_a_mis_parsed_comment(self):
+        """`KEY= # note` yields the note as the value. Checked across the whole
+        file, not just this key, since the trap is the file format's."""
+        from dotenv import dotenv_values
+
+        offenders = [
+            k for k, v in dotenv_values(".env.template").items() if (v or "").startswith("#")
+        ]
+        assert offenders == [], f"inline comment parsed as a value: {offenders}"
