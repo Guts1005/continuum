@@ -25,7 +25,11 @@ from continuum.session.exceptions import (
     SessionMessageLimitError,
     SessionNotEnabledError,
     SessionNotFoundError,
+    SessionOwnershipError,
 )
+from continuum.session.ownership import describe as describe_ownership_problem
+from continuum.session.ownership import evaluate_ownership
+from continuum.session.principal import get_principal
 from continuum.session.providers import create_provider, list_providers
 from continuum.session.providers.memory import MemorySessionProvider
 from continuum.session.types import ChatMessage, SessionMetadata
@@ -340,6 +344,106 @@ class SessionClient:
         self._provider = self._make_memory_fallback(reason)
         self._provider_resolved = True
 
+    # -------------------------------------------------------------------------
+    # Session ownership
+    #
+    # A session id names storage; it is not authorization on its own. The check
+    # lives here rather than in AgentRunner because the runner is not the only
+    # door: LLMClient.achat(session_id=...) loads and saves history directly and
+    # takes no user_id at all. Both paths funnel through this client, so this is
+    # the one seam that covers them — and covers whatever is added next without
+    # its author having to remember.
+    # -------------------------------------------------------------------------
+
+    def _ownership_check_applies(self) -> bool:
+        """Whether the configured policy could refuse anything on this call.
+
+        When no principal is bound and none is required, every outcome is
+        "allow", so the stored owner never needs to be read. This is what keeps
+        the added cost at exactly zero for deployments that have not adopted
+        principals: no extra round-trip, no behaviour change.
+        """
+        return get_principal() is not None or self._session_config.require_principal
+
+    async def _stored_owner(self, session_id: str) -> tuple[str | None, bool]:
+        """Read the session's recorded owner.
+
+        Returns ``(owner, unverifiable)``. ``unverifiable`` is True when the
+        answer cannot be trusted — a degraded store makes every session look
+        unowned, which must not be mistaken for "nobody owns this".
+
+        Goes to the provider directly rather than through
+        ``get_session_metadata`` so that gating that method cannot recurse.
+        """
+        try:
+            metadata: SessionMetadata | None = await self._call(
+                "get_session_metadata", session_id=session_id
+            )
+        except Exception as e:  # noqa: BLE001 — the store is what failed
+            logger.debug(f"Ownership lookup failed for {session_id}: {e}")
+            return None, True
+        if metadata is None:
+            # Absent metadata on a healthy store genuinely means "no such
+            # session, or no owner recorded". On a degraded one it means nothing.
+            return None, self.persistence_degraded
+        return metadata.user_id, False
+
+    async def _require_ownership(self, session_id: str, *, operation: str) -> None:
+        """Refuse the operation if this caller does not own the session.
+
+        Raises only under ``session_ownership='enforce'``; 'open' and 'audit'
+        report the same finding and continue, so a deployment can measure the
+        impact before enforcing.
+        """
+        if not session_id or not self._ownership_check_applies():
+            return
+
+        stored_owner, unverifiable = await self._stored_owner(session_id)
+        check = evaluate_ownership(
+            stored_user_id=stored_owner,
+            principal=get_principal(),
+            mode=self._session_config.session_ownership,
+            require_principal=self._session_config.require_principal,
+            unverifiable=unverifiable,
+        )
+        if check.clean:
+            return
+
+        problem = check.problem or "unknown"
+        self._emit_ownership_metric(problem, refused=not check.allowed)
+
+        if not check.allowed:
+            # The message never names the stored owner: the caller has just
+            # failed to prove they are that person, so disclosing it would turn
+            # the refusal into an identity oracle.
+            raise SessionOwnershipError(
+                describe_ownership_problem(problem, session_id),
+                session_id=session_id,
+            )
+
+        log = logger.warning if self._session_config.session_ownership == "audit" else logger.debug
+        log(
+            f"Session ownership check would have refused {operation} "
+            f"on session {session_id!r} ({problem}); allowed because "
+            f"session_ownership={self._session_config.session_ownership!r}.",
+            extra={"session_id": session_id, "ownership_problem": problem},
+        )
+
+    def _emit_ownership_metric(self, problem: str, *, refused: bool) -> None:
+        """Count ownership findings so 'audit' mode can actually be measured.
+
+        Best-effort: metrics must never break session operations.
+        """
+        try:
+            from continuum.observability.metrics import get_metrics_collector
+
+            collector = get_metrics_collector()
+            collector.increment(f"session_ownership_{problem}")
+            if refused:
+                collector.increment("session_ownership_refused")
+        except Exception:  # noqa: BLE001 — metrics are best-effort
+            pass
+
     async def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke a provider method, degrading to in-memory on a connection loss.
 
@@ -521,6 +625,7 @@ class SessionClient:
             SessionError: If operation fails.
         """
         self._ensure_enabled()
+        await self._require_ownership(session_id, operation="add_message")
 
         try:
             # Add to short-term memory (via provider)
@@ -838,6 +943,7 @@ class SessionClient:
             SessionError: If operation fails.
         """
         self._ensure_enabled()
+        await self._require_ownership(session_id, operation="get_conversation_history")
 
         try:
             messages: list[ChatMessage] = await self._call(
@@ -887,6 +993,7 @@ class SessionClient:
             SessionError: If operation fails.
         """
         self._ensure_enabled()
+        await self._require_ownership(session_id, operation="get_relevant_memories")
 
         memory_client = self._resolve_memory_client()
         if not memory_client or not memory_client.is_enabled:
@@ -940,6 +1047,7 @@ class SessionClient:
             SessionError: If operation fails.
         """
         self._ensure_enabled()
+        await self._require_ownership(session_id, operation="clear_session")
 
         try:
             result: bool = await self._call("clear_session", session_id=session_id)
@@ -974,6 +1082,7 @@ class SessionClient:
             SessionError: If operation fails.
         """
         self._ensure_enabled()
+        await self._require_ownership(session_id, operation="delete_session")
 
         try:
             result: bool = await self._call("delete_session", session_id=session_id)
@@ -1008,6 +1117,7 @@ class SessionClient:
             SessionError: If operation fails.
         """
         self._ensure_enabled()
+        await self._require_ownership(session_id, operation="get_session_metadata")
 
         try:
             metadata_result: SessionMetadata | None = await self._call(
@@ -1050,6 +1160,7 @@ class SessionClient:
         """
 
         self._ensure_enabled()
+        await self._require_ownership(session_id, operation="update_session_metadata")
 
         try:
             result: bool = await self._call("update_session_metadata", session_id, metadata)

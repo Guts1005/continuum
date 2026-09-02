@@ -312,6 +312,30 @@ class Settings(BaseSettings):
     #             worse than failing loudly.
     session_fallback_mode: Literal["degrade", "fail"] = "degrade"
 
+    # --- Session ownership (a session id is a name, not an authorization) ---
+    # How to react when a caller touches a session owned by a different
+    # principal (see continuum.session.bind_principal):
+    #   'open'    (default) — report it, allow it. Today's behaviour; upgrading
+    #             never changes what a running deployment does.
+    #   'audit'   — report it loudly with a metric, still allow. The measuring
+    #             step: see what would break before you enforce.
+    #   'enforce' — raise SessionOwnershipError.
+    session_ownership: Literal["open", "audit", "enforce"] = "open"
+    # Treat "no principal bound" as an ownership problem. Off by default so
+    # callers that never adopted principals keep working; turn it on once your
+    # auth boundary binds one on every request.
+    session_require_principal: bool = False
+    # Derive session ids as an HMAC of the identifiers rather than storing them
+    # in plaintext, so "u:{user_id}" can no longer be constructed by anyone who
+    # knows a user id. Changes every key — see the dual-read migration in
+    # continuum.session.identity. Requires SESSION_ID_SECRET.
+    session_hash_ids: bool = False
+    # The HMAC key for the above. Must be identical across every process and
+    # stable across restarts: it is a derivation parameter, not a per-process
+    # random. A per-worker value would split one user's history across workers
+    # and orphan every stored session on redeploy.
+    session_id_secret: str | None = None
+
     # -------------------------------------------------------------------------
     # Context Management Configuration (Dynamic Context Compression)
     # -------------------------------------------------------------------------
