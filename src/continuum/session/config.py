@@ -192,23 +192,26 @@ class SessionConfig(BaseModel):
         default_factory=lambda: settings.session_ownership,
         description=(
             "How to react when a caller touches a session owned by a different "
-            "principal (bound via continuum.session.bind_principal). 'open' "
-            "(default) reports the problem and allows the call — today's "
-            "behaviour, so upgrading changes nothing for a running deployment. "
-            "'audit' reports it loudly with a metric and still allows it, which "
-            "is how you measure impact before switching on enforcement. "
-            "'enforce' raises SessionOwnershipError. Sessions with no stored "
-            "owner (anonymous / single-user deployments) are never affected."
+            "principal (bound via continuum.session.bind_principal). 'enforce' "
+            "(default) raises SessionOwnershipError — secure by default, since "
+            "a session id names storage and is not authorization on its own. "
+            "'audit' reports the problem loudly with a metric and allows the "
+            "call, which is how a deployment measures impact before enforcing. "
+            "'open' reports it quietly and allows it (the pre-ownership "
+            "behaviour). Sessions with no stored owner (anonymous / single-user "
+            "deployments) are never affected by any mode."
         ),
     )
     require_principal: bool = Field(
         default_factory=lambda: settings.session_require_principal,
         description=(
-            "Treat 'no principal bound' as an ownership problem. Off by default: "
-            "with hashed session ids an unguessable id in a caller's hand is "
-            "reasonable evidence they were given it, so capability-style access "
-            "stays available and existing callers keep working. Turn this on "
-            "once your auth boundary binds a principal on every request."
+            "Treat 'no principal bound' as an ownership problem. On by default: "
+            "an owned session should be reachable only by a caller who has said "
+            "who they are, so 'I did not identify myself' is refused rather than "
+            "waved through as capability-style access. Set False to allow it — "
+            "defensible once session ids are hashed, since an unguessable id in "
+            "a caller's hand is reasonable evidence they were given it. Sessions "
+            "with no stored owner are unaffected either way."
         ),
     )
     hash_session_ids: bool = Field(

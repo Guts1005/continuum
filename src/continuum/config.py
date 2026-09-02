@@ -315,16 +315,22 @@ class Settings(BaseSettings):
     # --- Session ownership (a session id is a name, not an authorization) ---
     # How to react when a caller touches a session owned by a different
     # principal (see continuum.session.bind_principal):
-    #   'open'    (default) — report it, allow it. Today's behaviour; upgrading
-    #             never changes what a running deployment does.
+    #   'open'    — report it, allow it. The pre-ownership behaviour.
     #   'audit'   — report it loudly with a metric, still allow. The measuring
     #             step: see what would break before you enforce.
-    #   'enforce' — raise SessionOwnershipError.
-    session_ownership: Literal["open", "audit", "enforce"] = "open"
-    # Treat "no principal bound" as an ownership problem. Off by default so
-    # callers that never adopted principals keep working; turn it on once your
-    # auth boundary binds one on every request.
-    session_require_principal: bool = False
+    #   'enforce' (default) — raise SessionOwnershipError.
+    # Secure by default: almost nobody changes a default, so shipping "report
+    # but allow" would ship a check that in most deployments never refuses
+    # anything — the same shape as the warning it replaced. A deployment that
+    # cannot bind principals yet opts DOWN (SESSION_OWNERSHIP=open,
+    # SESSION_REQUIRE_PRINCIPAL=false) rather than opting in to protection.
+    session_ownership: Literal["open", "audit", "enforce"] = "enforce"
+    # Treat "no principal bound" as an ownership problem. On by default: an
+    # owned session should be reachable only by a caller who has identified
+    # themselves, so "I did not say who I am" is refused rather than waved
+    # through. Sessions with no stored owner (anonymous / single-user
+    # deployments) are unaffected either way.
+    session_require_principal: bool = True
     # Derive session ids as an HMAC of the identifiers rather than storing them
     # in plaintext, so "u:{user_id}" can no longer be constructed by anyone who
     # knows a user id. Changes every key — see the dual-read migration in

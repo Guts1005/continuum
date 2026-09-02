@@ -280,10 +280,13 @@ class TestSessionClientGate:
         await client.add_message(sid, ChatMessage(role="user", content="hi"), store_in_memory=False)
         assert len(await client.get_conversation_history(sid)) == 1
 
-    async def test_no_principal_bound_still_works(self):
-        """Backward compatibility: callers that never adopted principals keep
-        working, because Fix A removed the guessability that made this unsafe."""
-        client = _client()
+    async def test_capability_access_is_available_but_must_be_asked_for(self):
+        """``require_principal=False`` restores capability-style access: an
+        unguessable id in a caller's hand is treated as evidence they were given
+        it. Defensible once ids are hashed, and the migration path for an app
+        that cannot bind principals yet — but it is opt-down, not the default.
+        """
+        client = _client(require_principal=False)
         sid = await _seed_owned_session(client)
         assert await client.get_conversation_history(sid) == []
 
@@ -299,10 +302,6 @@ class TestSessionClientGate:
         sid = await _seed_owned_session(client)
         with bind_principal("mallory"):
             await client.get_conversation_history(sid)  # allowed, reported
-
-    async def test_open_mode_is_todays_behaviour(self):
-        """The default must not change under anyone's feet on upgrade."""
-        assert SessionConfig().session_ownership == "open"
 
 
 @pytest.mark.asyncio
@@ -397,3 +396,96 @@ class TestFixesCompose:
         with bind_principal("mallory"):
             with pytest.raises(SessionOwnershipError):
                 await client.get_conversation_history(real)
+
+
+# ── the shipped defaults ──────────────────────────────────────────────────────
+
+
+class TestSecureByDefault:
+    """The defaults are the security posture.
+
+    Almost nobody changes a default, so shipping 'report but allow' would mean
+    shipping a check that, in most deployments, never refuses anything — the
+    same shape as the warning this whole change replaced. The strict setting is
+    therefore the default, and a deployment that cannot adopt principals yet
+    opts *down* deliberately rather than opting in to protection.
+    """
+
+    def test_ownership_is_enforced_by_default(self):
+        assert SessionConfig().session_ownership == "enforce"
+
+    def test_a_principal_is_required_by_default(self):
+        assert SessionConfig().require_principal is True
+
+    def test_the_underlying_settings_agree(self):
+        """The pydantic field reads from settings, so both must move together —
+        otherwise SESSION_OWNERSHIP would silently disagree with the code."""
+        from continuum.config import settings
+
+        assert settings.session_ownership == "enforce"
+        assert settings.session_require_principal is True
+
+    def test_a_deployment_can_still_opt_down(self):
+        """The escape hatch has to work, because the strict default is a
+        breaking change for callers that have not adopted principals."""
+        cfg = SessionConfig(session_ownership="open", require_principal=False)
+        assert cfg.session_ownership == "open"
+        assert cfg.require_principal is False
+
+
+@pytest.mark.asyncio
+class TestSecureByDefaultBehaviour:
+    def _default_client(self) -> SessionClient:
+        """A client on shipped defaults — nothing about ownership configured."""
+        cfg = SessionConfig(enabled=True, provider="memory")
+        client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
+        client.set_provider(MemorySessionProvider(cfg))
+        client._initialized = True
+        return client
+
+    async def test_an_owned_session_refuses_an_unidentified_caller(self):
+        """The headline consequence: holding the id is no longer enough."""
+        client = self._default_client()
+        sid = await _seed_owned_session(client, owner="alice")
+
+        with pytest.raises(SessionOwnershipError):
+            await client.get_conversation_history(sid)
+
+    async def test_the_owner_still_reaches_their_own_session(self):
+        client = self._default_client()
+        sid = await _seed_owned_session(client, owner="alice")
+
+        with bind_principal("alice"):
+            await client.add_message(
+                sid, ChatMessage(role="user", content="hi"), store_in_memory=False
+            )
+            assert len(await client.get_conversation_history(sid)) == 1
+
+    async def test_anonymous_deployments_are_untouched(self):
+        """A session created without a user_id has no owner, so there is nobody
+        to exclude. Single-user CLIs and demos must keep working on defaults."""
+        client = self._default_client()
+        sid = await client.get_or_create_session()
+
+        await client.add_message(sid, ChatMessage(role="user", content="hi"), store_in_memory=False)
+        assert len(await client.get_conversation_history(sid)) == 1
+
+    async def test_a_stranger_is_refused_on_defaults(self):
+        client = self._default_client()
+        sid = await _seed_owned_session(client, owner="alice")
+
+        with bind_principal("mallory"):
+            with pytest.raises(SessionOwnershipError):
+                await client.get_conversation_history(sid)
+
+    async def test_opting_down_restores_the_previous_behaviour(self):
+        """The migration path for an app that cannot bind principals yet."""
+        cfg = SessionConfig(
+            enabled=True, provider="memory", session_ownership="open", require_principal=False
+        )
+        client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
+        client.set_provider(MemorySessionProvider(cfg))
+        client._initialized = True
+
+        sid = await _seed_owned_session(client, owner="alice")
+        assert await client.get_conversation_history(sid) == []  # allowed, as before

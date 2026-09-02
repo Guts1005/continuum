@@ -15,11 +15,27 @@ import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from continuum.core.background_tasks import BackgroundTaskRegistry
 from continuum.llm.types import ChatMessage
 from continuum.session.client import SessionClient
 from continuum.session.config import SessionConfig
+from continuum.session.principal import bind_principal
 from continuum.session.types import SessionMetadata
+
+
+@pytest.fixture(autouse=True)
+def _identify_as_the_session_owner():
+    """Every test here drives a session owned by ``user-1`` (see ``_metadata``).
+
+    Session ownership is enforced by default, so a caller must say who it is —
+    exactly what a real application does at its auth boundary. These tests are
+    about memory-write routing, not ownership, so they identify once here
+    rather than repeating it in twenty places.
+    """
+    with bind_principal("user-1"):
+        yield
 
 
 def _metadata(session_id="sess-1234abcd"):
