@@ -1895,33 +1895,42 @@ runner = <span class="cls">AgentRunner</span>(
 
   <a class="anchor" id="run-session"></a>
   <h2>Session History</h2>
-  <p>Pass a <code>session_id</code> to automatically load and save conversation history from Redis.</p>
-<div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="cm"># Turn 1 — user's first message</span>
-response1 = <span class="kw">await</span> runner.run(agent, <span class="str">"My name is Alice."</span>, session_id=<span class="str">"sess-1"</span>, user_id=<span class="str">"u-1"</span>)
+  <p>Pass a <code>session_id</code> to automatically load and save conversation history from Redis. Bind the caller's verified identity around the run: a session that records an owner is not readable or writable without it — see <a onclick="showSection('components'); scrollToAnchor('comp-session')">Sessions</a>.</p>
+<div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="kw">from</span> continuum.session <span class="kw">import</span> bind_principal
 
-<span class="cm"># Turn 2 — agent remembers context from Redis</span>
-response2 = <span class="kw">await</span> runner.run(agent, <span class="str">"What's my name?"</span>, session_id=<span class="str">"sess-1"</span>, user_id=<span class="str">"u-1"</span>)
-<span class="cm"># → "Your name is Alice."</span></pre></div>
+<span class="kw">with</span> <span class="fn">bind_principal</span>(<span class="str">"u-1"</span>):          <span class="cm"># an id you verified, not one the caller sent</span>
+
+    <span class="cm"># Turn 1 — user's first message</span>
+    response1 = <span class="kw">await</span> runner.run(agent, <span class="str">"My name is Alice."</span>, session_id=<span class="str">"sess-1"</span>, user_id=<span class="str">"u-1"</span>)
+
+    <span class="cm"># Turn 2 — agent remembers context from Redis</span>
+    response2 = <span class="kw">await</span> runner.run(agent, <span class="str">"What's my name?"</span>, session_id=<span class="str">"sess-1"</span>, user_id=<span class="str">"u-1"</span>)
+    <span class="cm"># → "Your name is Alice."</span></pre></div>
 
   <p>Control how many turns are loaded with <code>AgentConfig.session_history_turns</code>. Set <code>log_to_session=False</code> in <code>AgentConfig</code> to disable session writes for intermediate pipeline agents.</p>
 
   <a class="anchor" id="run-session-create"></a>
   <h3>Creating sessions with get_or_create_session()</h3>
-  <p>If you want session history to persist across requests, create a session <em>before</em> calling <code>runner.run()</code>. Passing a <code>session_id</code> that was never created will silently fail to save or load history.</p>
-<div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="cm"># Step 1: create or retrieve the session</span>
-session_id = <span class="kw">await</span> session_client.get_or_create_session(
-    session_id=session_id,          <span class="cm"># pass existing ID to resume</span>
-    user_id=<span class="str">"user-123"</span>,
-    conversation_id=<span class="str">"conv-456"</span>,   <span class="cm"># optional — see below</span>
-)
+  <p>If you want session history to persist across requests, create a session <em>before</em> calling <code>runner.run()</code>. Passing a <code>session_id</code> that was never created will silently fail to save or load history — set <code>SessionConfig.strict_sessions=True</code> to raise instead. Passing one that <em>was</em> created, and is owned by a user, fails differently: without a bound principal it raises <code>SessionOwnershipError</code> rather than failing quietly.</p>
+<div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="kw">from</span> continuum.session <span class="kw">import</span> bind_principal
 
-<span class="cm"># Step 2: run with that session_id</span>
-response = <span class="kw">await</span> runner.run(
-    agent=agent,
-    input=<span class="str">"Hello!"</span>,
-    session_id=session_id,
-    user_id=<span class="str">"user-123"</span>,
-)</pre></div>
+<span class="cm"># Step 0: bind the identity you just authenticated</span>
+<span class="kw">with</span> <span class="fn">bind_principal</span>(<span class="str">"user-123"</span>):
+
+    <span class="cm"># Step 1: create or retrieve the session</span>
+    session_id = <span class="kw">await</span> session_client.get_or_create_session(
+        session_id=session_id,          <span class="cm"># pass existing ID to resume</span>
+        user_id=<span class="str">"user-123"</span>,
+        conversation_id=<span class="str">"conv-456"</span>,   <span class="cm"># optional — see below</span>
+    )
+
+    <span class="cm"># Step 2: run with that session_id</span>
+    response = <span class="kw">await</span> runner.run(
+        agent=agent,
+        input=<span class="str">"Hello!"</span>,
+        session_id=session_id,
+        user_id=<span class="str">"user-123"</span>,
+    )</pre></div>
 
   <h4>How session_id is computed</h4>
   <p><code>get_or_create_session()</code> derives a deterministic key from the arguments you pass:</p>
@@ -1932,6 +1941,7 @@ response = <span class="kw">await</span> runner.run(
     <tr><td><code>user_id</code> only</td><td><code>u:{user_id}</code></td></tr>
     <tr><td>neither</td><td>random UUID</td></tr>
   </table>
+  <p>These keys are <strong>derivable</strong>: anyone who knows a user id can construct that user's session id. Ownership checking is what stops them using it; <code>SESSION_HASH_IDS=true</code> derives the key as an HMAC (<code>s_&lt;hex&gt;</code>) so they cannot name it either, while keeping the determinism above.</p>
 
   <h4>When to use conversation_id</h4>
   <p>Use <code>conversation_id</code> when a single user can have multiple independent chat windows. Without it, all conversations for a user share one session (<code>u:{user_id}</code>). With it, each window gets its own isolated session (<code>c:{conversation_id}:u:{user_id}</code>).</p>
@@ -1962,6 +1972,10 @@ response = <span class="kw">await</span> runner.run(
 
   <div class="callout callout-warn">
     <strong>Custom workflow agents:</strong> If you build a custom workflow by subclassing <code>BaseAgent</code>, you must follow this pattern yourself. Forgetting <code>suppress_session_log = True</code> will save every sub-agent turn to session history.
+  </div>
+
+  <div class="callout callout-warn">
+    <strong><code>save_turn()</code> is ownership-checked:</strong> it writes through the same path as any other session write, so on an owned session it raises <code>SessionOwnershipError</code> unless a principal is bound. Bind it once around the whole workflow, not per sub-agent call.
   </div>
 
   <a class="anchor" id="run-final"></a>
@@ -2729,21 +2743,27 @@ results = <span class="kw">await</span> memory.search(<span class="str">"user pr
   <h2>Sessions (Redis)</h2>
   <p>Short-term conversation history stored in Redis. <code>AgentRunner</code> handles loading and saving automatically — you only use <code>SessionClient</code> directly when you need to manage sessions outside a run (e.g. building a chat history UI, clearing history, debugging).</p>
   <p>Persistence initializes <strong>lazily</strong> — no connection is attempted (and no warnings logged) until the first session op, so a disabled or unconfigured Redis costs nothing. If Redis is unreachable, the client degrades to a non-durable in-memory store and keeps serving with a single warning instead of an error per request. Which you want is a choice: <code>degrade</code> (the default) keeps the app running through the outage, while <code>fail</code> raises instead — surfacing the error loudly so you can catch and debug it. Set <code>SESSION_FALLBACK_MODE</code> to opt in; it defaults to <code>degrade</code>. Either way the fallback flips a <code>session_persistence</code> health check to <code>degraded</code> and a <code>session_persistence_degraded</code> gauge to <code>1.0</code> for alerting.</p>
-<div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="kw">from</span> continuum.session <span class="kw">import</span> <span class="cls">SessionClient</span>
+  <p><strong>Ownership.</strong> A session id names storage — it is not proof of who is calling. When a session records a <code>user_id</code>, the caller must have bound a matching principal or the read is refused with <code>SessionOwnershipError</code>. Bind it once where you authenticate, using <code>bind_principal()</code>; <code>AgentRunner</code>, <code>LLMClient</code> and <code>SessionClient</code> all inherit it without an argument being threaded through. Bind an id you <em>verified</em> — one the caller supplied compares an attacker-controlled value against itself. Sessions created without a <code>user_id</code> have no owner and need no principal, so anonymous and single-user apps are unaffected. Upgrading an app that does not bind one yet? <code>SESSION_OWNERSHIP=audit</code> with <code>SESSION_REQUIRE_PRINCIPAL=false</code> reports what enforcement would refuse without refusing it, so you can measure the impact before taking it.</p>
+  <p><strong>Opaque ids.</strong> By default a session id is built in plaintext from the identifiers it scopes — <code>u:{user_id}</code> — so anyone who knows a user id can <em>construct</em> it. Ownership checking is what stops them using it; <code>SESSION_HASH_IDS=true</code> stops them naming it at all, and keeps user identifiers out of Redis keys, log lines and traces. Recommended for multi-tenant deployments, and doing real work if you have relaxed <code>SESSION_REQUIRE_PRINCIPAL</code> while migrating. It needs <code>SESSION_ID_SECRET</code> (<code>openssl rand -hex 32</code>) — startup fails without one rather than falling back to plaintext, and weak or placeholder values are refused. The secret is a derivation parameter, not a per-process random: it must be <em>identical in every process</em> (a per-worker value splits one user's history across workers) and <em>stable across restarts</em> (changing it re-derives every id). Determinism is preserved — the same identifiers still resolve to the same session — and existing plaintext sessions migrate to their new keys on first access.</p>
+<div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="kw">from</span> continuum.session <span class="kw">import</span> <span class="cls">SessionClient</span>, bind_principal
 
 session = <span class="cls">SessionClient</span>()
 
-<span class="cm"># Create or resume a session</span>
-session_id = <span class="kw">await</span> session.get_or_create_session(user_id=<span class="str">"user-123"</span>)
+<span class="cm"># Bind the caller's verified identity — an owned session is not</span>
+<span class="cm"># readable or writable without it.</span>
+<span class="kw">with</span> <span class="fn">bind_principal</span>(<span class="str">"user-123"</span>):
 
-<span class="cm"># Read history (e.g. to display in a chat UI)</span>
-messages = <span class="kw">await</span> session.get_conversation_history(session_id)
+    <span class="cm"># Create or resume a session</span>
+    session_id = <span class="kw">await</span> session.get_or_create_session(user_id=<span class="str">"user-123"</span>)
 
-<span class="cm"># Clear messages but keep the session</span>
-<span class="kw">await</span> session.clear_session(session_id)
+    <span class="cm"># Read history (e.g. to display in a chat UI)</span>
+    messages = <span class="kw">await</span> session.get_conversation_history(session_id)
 
-<span class="cm"># Delete the session entirely</span>
-<span class="kw">await</span> session.delete_session(session_id)</pre></div>
+    <span class="cm"># Clear messages but keep the session</span>
+    <span class="kw">await</span> session.clear_session(session_id)
+
+    <span class="cm"># Delete the session entirely</span>
+    <span class="kw">await</span> session.delete_session(session_id)</pre></div>
 
   <a class="anchor" id="comp-temporal"></a>
   <h2>Temporal Integration</h2>
