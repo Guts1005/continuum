@@ -20,6 +20,7 @@ from continuum.config import settings
 
 # Type aliases for memory hooks
 MemoryPreStoreFilter = Callable[[list[str]], list[str]]
+MemoryRecallAction = Literal["fence", "drop", "block"]
 MemoryOnStoredCallback = Callable[[list[str]], None]
 
 if TYPE_CHECKING:
@@ -78,6 +79,19 @@ class AgentMemoryConfig:
     on_stored: MemoryOnStoredCallback | None = field(
         default=None, repr=False, compare=False, hash=False
     )
+
+    # What to do when recall returns rows carrying provenance labels (F6).
+    #   "fence" — return them, fenced in the prompt and tainting the run (default,
+    #             and what every existing deployment already does)
+    #   "drop"  — omit them; they never reach the prompt and do not taint
+    #   "block" — refuse the turn until a person approves or deletes them
+    # A Literal rather than an enum, matching ToolTrustConfig.on_unreviewed.
+    # Left as an operator choice rather than a hardcoded refusal because which
+    # is right depends on who reviews and how quickly: blocking is the strongest
+    # (untrusted text never reaches the model at all, so it does not rely on the
+    # model honouring a fence) and is also the one that turns a single planted
+    # row into an outage if nobody is watching the queue.
+    on_labeled_recall: MemoryRecallAction = "fence"
 
     # Memory-scope provenance — declare which memory scopes hold sensitive data.
     # Maps scope value ("user"/"agent"/"conversation"/custom) -> labels. When a

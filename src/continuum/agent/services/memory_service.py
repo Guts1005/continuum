@@ -239,6 +239,39 @@ class MemoryService(IMemoryService):
                 )
 
             if memories.results:
+                # What to do with rows carrying provenance (F6). Recall is the
+                # one taint source nobody asked for: the row arrives during
+                # prompt assembly and was written in an earlier session, so by
+                # the time the label is known the text would already be in the
+                # prompt. "fence" is the default and the weakest -- it asks the
+                # model not to obey. The other two keep it out of the prompt
+                # entirely; "block" additionally forces a person to look.
+                action = getattr(agent.memory_config, "on_labeled_recall", "fence")
+                if action != "fence":
+                    labeled = [m for m in memories.results if _row_provenance_labels([m])]
+                    if labeled:
+                        if action == "block":
+                            from continuum.agent.exceptions import (
+                                MemoryReviewRequiredError,
+                            )
+
+                            raise MemoryReviewRequiredError(
+                                memory_ids=[str(getattr(m, "id", "")) for m in labeled],
+                                labels=sorted(_row_provenance_labels(labeled)),
+                            )
+                        # drop: the rows never enter the prompt, so the run did
+                        # not touch them and must not be tainted by them either.
+                        kept = [m for m in memories.results if m not in labeled]
+                        logger.info(
+                            "🚫 Dropped %d recalled memory row(s) carrying provenance %s "
+                            "(on_labeled_recall='drop')",
+                            len(labeled),
+                            sorted(_row_provenance_labels(labeled)),
+                        )
+                        memories.results = kept
+                        if not kept:
+                            return []
+
                 context.retrieved_memories = [m.to_dict() for m in memories.results]
 
                 # Memory-scope provenance: reading data out of a scope declared
@@ -284,8 +317,17 @@ class MemoryService(IMemoryService):
             return []
 
         except Exception as e:
-            from continuum.agent.exceptions import MemoryAccessDeniedError
+            from continuum.agent.exceptions import (
+                MemoryAccessDeniedError,
+                MemoryReviewRequiredError,
+            )
 
+            if isinstance(e, MemoryReviewRequiredError):
+                # Deliberately not swallowed. Everything else here is
+                # best-effort and degrades to "no memories", but a review demand
+                # that degrades is a human step silently skipped -- which is the
+                # one thing this mode exists to prevent.
+                raise
             if isinstance(e, MemoryAccessDeniedError):
                 # Expected: a data-label policy blocked the read. That is the
                 # gate working, not a fault, and the same call the write path

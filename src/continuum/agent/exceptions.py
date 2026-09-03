@@ -338,6 +338,51 @@ class MemoryAccessDeniedError(AgentError, PolicyDeniedError):
             self.context["policy_name"] = policy_name
 
 
+class MemoryReviewRequiredError(AgentError, PolicyDeniedError):
+    """Raised when recall returns rows whose provenance a person has not cleared.
+
+    Only under ``on_labeled_recall="block"``. Recall is unlike the other taint
+    producers: a tool result is something the model chose to fetch this turn, a
+    run-level seed is something the operator decided up front, but a memory row
+    arrives unbidden during prompt assembly and was written in an earlier
+    session. By the time the label is known, untrusted text would already be in
+    the prompt.
+
+    Blocking is the forced human step, the same one F3 requires before an
+    unreviewed tool catalogue can reach a model, and for the same reason: this is
+    the case with no reliable automated defence. Fencing asks the model not to
+    obey and only two of four models tested reliably decline.
+
+    Carries the offending row ids because a block without a review path is an
+    outage rather than a workflow -- the caller needs them to link a reviewer
+    straight to the rows, who then approves or deletes each one.
+
+    A ``PolicyDeniedError``, so it is reported as a governance outcome rather
+    than a crash. Unlike its siblings it must NOT be swallowed by the
+    best-effort retrieval handlers: degrading to "no memories" would silently
+    skip the human step it exists to force.
+    """
+
+    def __init__(
+        self,
+        memory_ids: list[str] | None = None,
+        labels: list[str] | None = None,
+        **kwargs: Any,
+    ):
+        ids = list(memory_ids or [])
+        labs = sorted(set(labels or []))
+        message = (
+            f"{len(ids)} recalled memory row(s) carry unreviewed provenance "
+            f"{labs or '[]'} and this agent is configured to stop rather than use them. "
+            f"Review them (approve or delete) to continue."
+        )
+        super().__init__(message, **kwargs)
+        self.memory_ids = ids
+        self.labels = labs
+        self.context["memory_ids"] = ids
+        self.context["labels"] = labs
+
+
 class ModelAccessDeniedError(AgentError, PolicyDeniedError):
     """Raised when an access policy denies routing a run to a model/provider.
 

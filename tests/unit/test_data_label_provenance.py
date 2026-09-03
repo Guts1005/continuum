@@ -30,6 +30,8 @@ import logging
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from continuum.agent.utils.context_utils import create_run_context
 
 # ---------------------------------------------------------------------------
@@ -769,3 +771,178 @@ class TestUndeclaredProvenanceIsReported:
             await svc.store_memories(agent, [{"role": "user", "content": "x"}], ctx)
 
         assert warnings, "the write path has the same undeclared-provenance gap"
+
+
+# ---------------------------------------------------------------------------
+# What a labelled row does when it is recalled (security finding F6)
+#
+# Recall is not like the other taint producers. A tool result is something the
+# model chose to fetch this turn; a run-level seed is something the operator
+# decided up front. A memory row arrives unbidden during prompt assembly, and
+# the content was planted in an earlier session -- so by the time the label is
+# known, untrusted text is already in the prompt.
+#
+# Fencing it is the default and the weakest of the three: it asks the model not
+# to obey, and measured across four models only two reliably decline. Dropping
+# the row keeps it out of the prompt entirely. Blocking refuses the turn until a
+# person reviews the row -- the same forced human step F3 requires for an
+# unreviewed tool catalogue, and for the same reason: this is the case with no
+# reliable automated defence.
+#
+# Which of the three is right depends on who reviews and how fast, so it is an
+# operator choice rather than a framework default -- mirroring
+# ``ToolTrustConfig.on_unreviewed`` rather than hardcoding a refusal. Blocking
+# without a review path would just be an outage, so the error carries the row
+# ids the panel needs to link to.
+# ---------------------------------------------------------------------------
+
+
+def _memory_result_mixed():
+    """One clean row and one carrying provenance."""
+    from unittest.mock import MagicMock
+
+    res = MagicMock()
+    rows = []
+    for i, labels in ((0, None), (1, ["external"])):
+        m = MagicMock()
+        meta = {} if labels is None else {PROVENANCE_KEY: labels}
+        m.to_dict.return_value = {"memory": f"fact-{i}", "metadata": meta}
+        m.metadata = meta
+        m.id = f"row-{i}"
+        m.user_id = "u1"
+        m.score = 0.9
+        m.memory = f"fact-{i}"
+        rows.append(m)
+    res.results = rows
+    res.total_results = len(rows)
+    return res
+
+
+def _agent_with_recall_action(action=None, scope_labels=None):
+    from continuum.agent.base import BaseAgent
+    from continuum.agent.config import AgentConfig, AgentMemoryConfig
+
+    cfg = AgentMemoryConfig(scope_data_labels=scope_labels or {})
+    if action is not None:
+        cfg.on_labeled_recall = action
+    return BaseAgent(name="recall-agent", instructions="t", config=AgentConfig(), memory_config=cfg)
+
+
+class TestRecallActionDefault:
+    def test_default_is_fence(self):
+        """Today's behaviour stays the default: changing what an existing
+        deployment does on upgrade is not a security improvement."""
+        from continuum.agent.config import AgentMemoryConfig
+
+        assert AgentMemoryConfig().on_labeled_recall == "fence"
+
+
+class TestFenceKeepsEverything:
+    async def test_labelled_row_is_returned_and_taints(self):
+        svc = _memory_service(_memory_client(result=_memory_result_mixed()))
+        ctx = create_run_context(user_id="u1")
+
+        out = await svc.retrieve_memories(_agent_with_recall_action("fence"), "q", ctx)
+
+        assert len(out) == 2
+        assert "external" in ctx.data_labels
+
+
+class TestDropRemovesLabelledRows:
+    async def test_labelled_row_never_reaches_the_prompt(self):
+        svc = _memory_service(_memory_client(result=_memory_result_mixed()))
+        ctx = create_run_context(user_id="u1")
+
+        out = await svc.retrieve_memories(_agent_with_recall_action("drop"), "q", ctx)
+
+        texts = [m.get("memory") for m in out]
+        assert texts == ["fact-0"], "only the clean row should survive"
+
+    async def test_dropped_rows_do_not_taint(self):
+        """The row never entered the prompt, so the run did not touch it and
+        gating the rest of the turn on it would be punishing a non-event."""
+        svc = _memory_service(_memory_client(result=_memory_result_mixed()))
+        ctx = create_run_context(user_id="u1")
+
+        await svc.retrieve_memories(_agent_with_recall_action("drop"), "q", ctx)
+
+        assert ctx.data_labels == set()
+
+    async def test_clean_store_is_unaffected(self):
+        svc = _memory_service(_memory_client())  # rows carry no labels
+        ctx = create_run_context(user_id="u1")
+
+        out = await svc.retrieve_memories(_agent_with_recall_action("drop"), "q", ctx)
+
+        assert len(out) == 1
+
+
+class TestBlockStopsTheTurn:
+    async def test_raises_review_required(self):
+        from continuum.agent.exceptions import MemoryReviewRequiredError
+
+        svc = _memory_service(_memory_client(result=_memory_result_mixed()))
+        ctx = create_run_context(user_id="u1")
+
+        with pytest.raises(MemoryReviewRequiredError):
+            await svc.retrieve_memories(_agent_with_recall_action("block"), "q", ctx)
+
+    async def test_error_names_the_rows_to_review(self):
+        """Blocking without telling anyone which rows to look at is an outage,
+        not a workflow. The panel needs the ids to link to."""
+        from continuum.agent.exceptions import MemoryReviewRequiredError
+
+        svc = _memory_service(_memory_client(result=_memory_result_mixed()))
+        ctx = create_run_context(user_id="u1")
+
+        with pytest.raises(MemoryReviewRequiredError) as exc:
+            await svc.retrieve_memories(_agent_with_recall_action("block"), "q", ctx)
+
+        assert exc.value.memory_ids == ["row-1"]
+        assert exc.value.labels == ["external"]
+
+    async def test_clean_store_does_not_block(self):
+        """A false stop is worse than no stop: it trains people to ignore it."""
+        svc = _memory_service(_memory_client())
+        ctx = create_run_context(user_id="u1")
+
+        out = await svc.retrieve_memories(_agent_with_recall_action("block"), "q", ctx)
+
+        assert len(out) == 1
+
+    async def test_not_swallowed_by_the_best_effort_handler(self):
+        """retrieve_memories treats every other failure as best-effort and
+        returns []. A review demand that degrades to "no memories" would be
+        silently ignored, which is the opposite of forcing a human step."""
+        from continuum.agent.exceptions import MemoryReviewRequiredError
+
+        svc = _memory_service(_memory_client(result=_memory_result_mixed()))
+        ctx = create_run_context(user_id="u1")
+
+        with pytest.raises(MemoryReviewRequiredError):
+            await svc.retrieve_memories(_agent_with_recall_action("block"), "q", ctx)
+
+
+class TestBlockReachesTheCaller:
+    async def test_propagates_out_of_prepare_messages(self):
+        """message_builder also wraps retrieval in a best-effort handler, so the
+        demand has to survive two layers to actually stop the turn."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from continuum.agent.exceptions import MemoryReviewRequiredError
+        from continuum.agent.execution.message_builder import MessageBuilder
+
+        mem = MagicMock()
+        mem.retrieve_memories = AsyncMock(
+            side_effect=MemoryReviewRequiredError(memory_ids=["row-1"], labels=["external"])
+        )
+        sess = MagicMock()
+        sess.get_conversation_history = AsyncMock(return_value=[])
+        builder = MessageBuilder(memory_service=mem, session_service=sess)
+
+        agent = _agent_with_recall_action("block")
+        agent.memory_config.search_memories = True
+        ctx = create_run_context(user_id="u1")
+
+        with pytest.raises(MemoryReviewRequiredError):
+            await builder.prepare_messages(agent, "hello", ctx)

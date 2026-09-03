@@ -255,6 +255,14 @@ class MessageBuilder(IMessageBuilder):
                     if memory_content:
                         messages.append({"role": "system", "content": memory_content})
             except Exception as e:
+                from continuum.agent.exceptions import MemoryReviewRequiredError
+
+                if isinstance(e, MemoryReviewRequiredError):
+                    # The second best-effort handler this has to survive. Both
+                    # layers treat retrieval as optional and degrade to "no
+                    # memories"; a review demand that degrades is the human step
+                    # silently skipped, which is what the mode exists to force.
+                    raise
                 logger.warning(f"❌ Failed to retrieve memories: {e}", exc_info=True)
 
         # Inject pipeline context from sequential/supervised/planner workflows
