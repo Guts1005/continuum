@@ -16,7 +16,7 @@ policy. This demo wires all three producers and all four gates:
 | **Producer** | both `lookup_patient` tools declared PHI → calling either taints the run | `config.py` `tool_data_labels` |
 | **Gate** | PHI run denied the **cloud model** → re-routed on-prem | policy `phi-no-cloud-model` |
 | **Gate** | PHI run denied **exfiltration tools** (email / web) | policy `phi-no-exfiltration-tools` |
-| **Gate** | PHI run's **long-term memory write denied** (any scope) | policy `phi-never-persisted` (`memory:*`) |
+| **Gate** | PHI run's **long-term memory write denied** (any scope) | policy `phi-never-persisted` (`memory:write:*`) |
 | **Gate** | PHI run's **telemetry redacted** | policy `phi-redact-telemetry` |
 | **Gate** | PHI run's answer **not persisted verbatim to short-term memory** (session/Redis) → placeholder | policy `phi-no-short-term` (`session`) |
 

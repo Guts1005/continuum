@@ -284,6 +284,21 @@ class MemoryService(IMemoryService):
             return []
 
         except Exception as e:
+            from continuum.agent.exceptions import MemoryAccessDeniedError
+
+            if isinstance(e, MemoryAccessDeniedError):
+                # Expected: a data-label policy blocked the read. That is the
+                # gate working, not a fault, and the same call the write path
+                # already makes (session/client.py). A traceback here tells an
+                # operator something broke and sends them hunting a bug that is
+                # not there. The turn continues without memory: for a read gate,
+                # disclosing nothing and carrying on is the safe direction.
+                logger.info(
+                    "🛡️ Long-term memory read blocked by policy '%s' "
+                    "(run carried restricted data labels)",
+                    e.context.get("policy_name"),
+                )
+                return []
             logger.warning(f"❌ Failed to retrieve memories: {e}", exc_info=True)
             return []
 

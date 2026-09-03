@@ -160,7 +160,13 @@ def build_policy_store() -> PolicyStore:
         AccessPolicy(
             name="phi-never-persisted",
             subjects=[PHI],
-            resources=["memory:*"],
+            # memory:write:* , not memory:* . Both operations used to check one
+            # resource string, and the read gate never actually ran, so "memory:*"
+            # was in practice a write rule -- which is what this rule's name and
+            # denial message have always said. Now that reads are gated too,
+            # "memory:*" would also deny a PHI run RECALLING anything, which is
+            # not what this demo claims. Write "memory:read:*" to gate retrieval.
+            resources=["memory:write:*"],
             effect="deny",
             denial_message="Sensitive data must not be written to long-term memory.",
         )

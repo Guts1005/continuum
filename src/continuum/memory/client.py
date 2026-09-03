@@ -29,6 +29,7 @@ from continuum.memory.types import (
     MemoryMetadata,
     MemorySearchResult,
 )
+from continuum.security.policy_context import resolve_active_policy
 
 if TYPE_CHECKING:
     from continuum.security.policy import PolicyStore
@@ -202,6 +203,62 @@ class MemoryClient:
         """Check if memory is enabled and initialized."""
         return self._config.enabled and self._initialized and self._provider is not None
 
+    def _enforce_memory_policy(
+        self,
+        operation: str,
+        scope_label: str,
+        policy_store: "PolicyStore | None",
+        subject: str | None,
+        data_labels: set[str] | None,
+    ) -> set[str]:
+        """Gate one memory operation on the run's data labels.
+
+        Returns the effective labels, so a caller that also needs them -- the
+        write path stamps them onto the row as provenance -- does not resolve the
+        ambient policy a second time and risk disagreeing with the gate.
+
+        One implementation for reads and writes. There used to be two: ``add``
+        resolved the ambient run policy while ``search`` used its raw arguments,
+        and since automatic retrieval passes no policy arguments the read gate
+        never ran at all -- a run the policy said must not touch memory could
+        still read every row out of it. Two copies of one rule is how one copy
+        ends up wrong, and ``resolve_active_policy`` warns about exactly this:
+        threading policy args through every call site is "fragile, and silently
+        bypassed by any call site that forgets".
+
+        Resources checked, in order:
+
+        - ``memory:<operation>:<scope>`` -- the precise form, so a deployment can
+          say "never persist this, but recalling is fine". With one shared
+          resource string that was inexpressible, and a rule written to stop
+          persistence would silently start denying retrieval.
+        - ``memory:<scope>`` -- the legacy form. ``memory:*`` covers both new
+          shapes by fnmatch, but an exact ``memory:u1`` covers neither, and such
+          policies are already shipped. Checked so they do not quietly lapse.
+
+        Labels ride as additional subjects, the same convention the tool and
+        session gates use.
+        """
+        eff_store, eff_subject, eff_labels = resolve_active_policy(
+            policy_store, subject, data_labels
+        )
+        labels = set(eff_labels or ())
+        if eff_store is None or eff_subject is None:
+            return labels
+
+        from continuum.agent.exceptions import MemoryAccessDeniedError
+
+        subjects = [eff_subject, *sorted(eff_labels)] if eff_labels else eff_subject
+        for resource in (f"memory:{operation}:{scope_label}", f"memory:{scope_label}"):
+            decision = eff_store.check(subjects, resource)
+            if not decision.allowed:
+                raise MemoryAccessDeniedError(
+                    operation=operation,
+                    scope=scope_label,
+                    policy_name=decision.policy_name,
+                )
+        return labels
+
     def _ensure_enabled(self) -> None:
         """Raise error if memory is not enabled."""
         if not self.is_enabled:
@@ -307,26 +364,12 @@ class MemoryClient:
         """
         self._ensure_enabled()
 
-        # Access control check. Explicit policy args win; otherwise fall back to
-        # the ambient run policy — the session-save write path doesn't thread
-        # RunContext, so this is how a tainted run's labels gate the write.
-        from continuum.security.policy_context import resolve_active_policy
-
-        eff_store, eff_subject, eff_labels = resolve_active_policy(
-            policy_store, subject, data_labels
+        # Access control. Explicit policy args win; otherwise the ambient run
+        # policy is used — the session-save write path doesn't thread RunContext,
+        # so that is how a tainted run's labels reach the gate.
+        eff_labels = self._enforce_memory_policy(
+            "write", agent_id or user_id or "unknown", policy_store, subject, data_labels
         )
-        if eff_store is not None and eff_subject is not None:
-            from continuum.agent.exceptions import MemoryAccessDeniedError
-
-            scope_label = agent_id or user_id or "unknown"
-            subjects = [eff_subject, *sorted(eff_labels)] if eff_labels else eff_subject
-            decision = eff_store.check(subjects, f"memory:{scope_label}")
-            if not decision.allowed:
-                raise MemoryAccessDeniedError(
-                    operation="write",
-                    scope=scope_label,
-                    policy_name=decision.policy_name,
-                )
 
         # Build scope from identifiers
         scope = self._build_scope(user_id, agent_id, conversation_id)
@@ -393,6 +436,7 @@ class MemoryClient:
         filters: dict[str, Any] | None = None,
         policy_store: "PolicyStore | None" = None,
         subject: str | None = None,
+        data_labels: set[str] | None = None,
     ) -> MemorySearchResult:
         """
         Search memories using semantic similarity.
@@ -428,18 +472,12 @@ class MemoryClient:
             )
             query = query[:max_query_chars]
 
-        # Access control check
-        if policy_store is not None and subject is not None:
-            from continuum.agent.exceptions import MemoryAccessDeniedError
-
-            scope_label = agent_id or user_id or "unknown"
-            decision = policy_store.check(subject, f"memory:{scope_label}")
-            if not decision.allowed:
-                raise MemoryAccessDeniedError(
-                    operation="read",
-                    scope=scope_label,
-                    policy_name=decision.policy_name,
-                )
+        # Access control. Same gate as the write path: automatic retrieval
+        # passes no policy arguments, so resolving the ambient run policy here is
+        # what makes this reachable at all.
+        self._enforce_memory_policy(
+            "read", agent_id or user_id or "unknown", policy_store, subject, data_labels
+        )
 
         scope = self._build_scope(user_id, agent_id, conversation_id)
         identifiers = scope.to_identifiers()
@@ -711,6 +749,9 @@ class MemoryClient:
         conversation_id: str | None = None,
         limit: int | None = None,
         filters: dict[str, Any] | None = None,
+        policy_store: "PolicyStore | None" = None,
+        subject: str | None = None,
+        data_labels: set[str] | None = None,
     ) -> MemorySearchResult:
         """Synchronous version of search()."""
         return self._run_sync(
@@ -721,6 +762,9 @@ class MemoryClient:
                 conversation_id=conversation_id,
                 limit=limit,
                 filters=filters,
+                policy_store=policy_store,
+                subject=subject,
+                data_labels=data_labels,
             )
         )
 
