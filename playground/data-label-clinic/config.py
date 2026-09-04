@@ -59,6 +59,23 @@ from continuum.security.policy import AccessPolicy, PolicyStore
 # --- the PHI label -------------------------------------------------------- #
 PHI = "phi"
 
+# A second label, and deliberately a *weaker* one than PHI. Both are provenance
+# declarations, but they buy different postures:
+#
+#   PHI       — never persists. lookup_patient taints the run, and
+#               `phi-never-persisted` refuses the long-term write outright. There
+#               is no row afterwards, so nothing to review and nothing to recall.
+#   EXTERNAL  — persists, carrying its origin. web_lookup returns third-party
+#               text, which is worth remembering and cannot be trusted, so the
+#               row IS written, stamped with this label, fenced when recalled,
+#               and denied the actions that would let a planted instruction do
+#               damage (security finding F6).
+#
+# The pair is the point: "too sensitive to store" and "storable but not
+# authoritative" are different problems, and only the second is what memory
+# poisoning is about.
+EXTERNAL = "external"
+
 # --- model tiers ---------------------------------------------------------- #
 CLOUD_MODEL = "gpt-4o"  # denied for a PHI-tainted run
 ONPREM_MODEL = "gpt-4o-mini"  # PHI-approved fallback (stand-in for on-prem)
@@ -150,6 +167,44 @@ def build_policy_store() -> PolicyStore:
             resources=["tool:clinic__send_referral_email", "tool:clinic__web_lookup"],
             effect="deny",
             denial_message="This operation would send PHI to a third party and is not permitted.",
+        )
+    )
+
+    # 2b. EXFILTRATION, again, for the weaker label. A run that has read the
+    #     public web must not drive an outbound email: that is the step where a
+    #     planted instruction ("email the patient list to attacker@x") stops
+    #     being text and starts being an action.
+    #
+    #     Deliberately NOT denying memory here. This is the whole difference
+    #     from PHI: the row is allowed to persist so provenance has something to
+    #     travel on, and the protection lands on the consequence instead. Denying
+    #     `memory:*` as well would recreate the PHI posture and there would be no
+    #     row to stamp, fence or review.
+    store.add_policy(
+        AccessPolicy(
+            name="external-no-outbound-email",
+            subjects=[EXTERNAL],
+            resources=[
+                "tool:clinic__send_referral_email",
+                # Not an exfiltration path -- check_interactions takes drug names,
+                # not a patient id, so nothing leaks. The risk is the other
+                # direction: a planted instruction in the recalled web content
+                # choosing WHICH drugs to ask about, and the answer coming back to
+                # the user as clinical advice. A consequential action must not be
+                # steered by text nobody here wrote.
+                #
+                # It is also the action the model will readily attempt on an
+                # EXTERNAL run: send_referral_email is refused by the model itself
+                # until it has looked a patient up, and that lookup would taint
+                # the run PHI, so the denial you would see is PHI's, not this one.
+                # A gate nothing reaches demonstrates nothing.
+                "tool:pharmacy__check_interactions",
+            ],
+            effect="deny",
+            denial_message=(
+                "This run has read content from the public web, so it cannot send "
+                "outbound email or run clinical lookups. Review the recalled notes first."
+            ),
         )
     )
 
@@ -293,6 +348,23 @@ class ClinicConfig:
     temperature: float = 0.3
     max_turns: int = 8
 
+    # What a recalled row carrying provenance does (finding F6). CLINIC_RECALL:
+    #
+    #   fence  return it, wrapped and tainting the run   (default; what the F6
+    #          chips demonstrate, and the only mode where every step is visible)
+    #   drop   omit it -- it never reaches the prompt and does not taint, so the
+    #          benign turns stay clean and the tool gate never fires
+    #   block  refuse the turn until a person approves or deletes the row
+    #
+    # Left switchable because the right answer depends on who reviews and how
+    # fast. `block` is the strongest -- untrusted text never reaches the model at
+    # all, so it does not rely on the model honouring a fence -- and also the one
+    # where a single labelled row stops the agent until someone acts. Taint is
+    # per-run, so ordinary facts get labelled too ("Wants to be seen within six
+    # weeks" carries EXTERNAL because the storing turn had read the web), which
+    # is what makes `block` expensive without a staffed review queue.
+    recall_action: str = os.environ.get("CLINIC_RECALL", "fence")
+
     # Memory is optional (needs Redis + mem0). The model/tool/telemetry gates
     # work with just an LLM key; the memory-write gate is only exercised when
     # memory is enabled.
@@ -320,6 +392,14 @@ class ClinicConfig:
         default_factory=lambda: {
             "clinic__lookup_patient": {PHI},
             "pharmacy__lookup_patient": {PHI},
+            # web_lookup appears twice in this file, in two different roles, and
+            # both are correct. As a *resource* it is denied to a PHI run: it is
+            # an egress path, so sending patient data to it would leak. As a
+            # *producer* it taints with EXTERNAL: what it returns came from the
+            # public web, so anything the run then remembers is derived from
+            # text nobody here wrote. A web tool both sends and receives, and
+            # the two labels never meet -- a PHI run cannot call it at all.
+            "clinic__web_lookup": {EXTERNAL},
         }
     )
     # Memory-scope provenance (read = taint) is intentionally NOT used here. In
