@@ -42,7 +42,11 @@ from continuum import (
     ToolExecutor,
     get_logger,
 )
-from continuum.agent.exceptions import MemoryAccessDeniedError, ModelAccessDeniedError
+from continuum.agent.exceptions import (
+    MemoryAccessDeniedError,
+    MemoryReviewRequiredError,
+    ModelAccessDeniedError,
+)
 from continuum.agent.types import EventType, generate_run_id
 from continuum.core.container import Container, get_container
 from continuum.core.lifecycle import OrchestratorLifecycle, get_lifecycle_manager
@@ -274,6 +278,9 @@ class ClinicAgent:
                 store_scope=AgentMemoryScope.USER,
                 # read=taint: reading this scope taints the run with PHI.
                 scope_data_labels=self.config.scope_data_labels,
+                # what a recalled row carrying provenance does (F6): fence it,
+                # drop it, or refuse the turn until a person reviews it.
+                on_labeled_recall=self.config.recall_action,
             ),
             config=AgentConfig(
                 max_turns=self.config.max_turns,
@@ -357,6 +364,31 @@ class ClinicAgent:
             resp, ctx = await self._run_once(
                 message, self.config.cloud_model, user_id, conversation_id, session_id
             )
+        except MemoryReviewRequiredError as e:
+            # on_labeled_recall="block". Not a fault: the recalled rows carry
+            # provenance no person has cleared, and this agent is configured to
+            # stop rather than use them. Reported WITH the row ids so the panel
+            # can point a reviewer straight at them -- a block with no route to
+            # review is an outage, not a workflow.
+            self._agent.model = self.config.cloud_model
+            self._apply_scanner(True)
+            ids = ", ".join(i[:8] for i in e.memory_ids)
+            return {
+                "response": (
+                    f"Turn stopped: {len(e.memory_ids)} recalled memory row(s) carry "
+                    f"unreviewed provenance {e.labels}. Approve or delete them in the "
+                    f"LONG-TERM MEMORY panel, then ask again."
+                ),
+                "review_required": True,
+                "taint": [],
+                "model_used": None,
+                "gate_events": [
+                    f"🛡️ MEMORY RECALL — turn refused: {len(e.memory_ids)} row(s) "
+                    f"labelled {e.labels} awaiting review (ids: {ids}). "
+                    f"CLINIC_RECALL='block'."
+                ],
+                "tools_called": [],
+            }
         except ModelAccessDeniedError as e:
             # The PHI taint tripped the cloud-model deny mid-run. Re-run on the
             # PHI-approved on-prem model (the compliant fallback).
