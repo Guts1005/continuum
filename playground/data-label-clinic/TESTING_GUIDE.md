@@ -513,16 +513,74 @@ declares no data provenance, so the memory-poisoning defences are inactive…
   nothing, which is the failure mode nobody notices. Once per agent — this runs
   every turn, and a warning repeated each turn is one people filter out.
 
+**BM9 — the memory-write content filter (`CLINIC_FILTER`)**
+
+A `pre_store_filter` inspects the facts mem0 extracted and returns the ones
+allowed to remain. `CLINIC_FILTER` selects one:
+
+| value | filter |
+|---|---|
+| `off` (default) | none wired. Nothing examined, everything mem0 extracted is kept — the shipped SDK default, which ships no detector |
+| `pii` | drop any fact matching `_SSN_RE` (`\b\d{3}-\d{2}-\d{4}\b`) — the same regex the output scanner uses |
+| `broken` | a filter that raises, standing in for a scanner behind an HTTP call or a classifier that OOMs |
+
+14. Restart `web.py` with `CLINIC_FILTER=pii` and send **"My SSN is
+    123-45-6789, and I prefer morning appointments."** Two facts are extracted;
+    the filter rejects one:
+
+```
+INFO  🚫 pre_store_filter rejected 1 fact(s): ['dca06bcb-…']
+ERROR Rejected fact dca06bcb-… was not deleted (the provider reported failure)
+      — it REMAINS in long-term memory
+ERROR 1 fact(s) rejected by pre_store_filter are still stored: ['dca06bcb-…'].
+      … remove them out of band.
+```
+
+15. Restart with `CLINIC_FILTER=broken` and send the same message. The filter
+    raises, so **both** facts are rejected — including the harmless preference:
+
+```
+ERROR pre_store_filter raised (RuntimeError: PII scanner unavailable) —
+      rejecting all 2 fact(s) from this write, since nothing is known about
+      their contents
+INFO  🚫 pre_store_filter rejected 2 fact(s): ['f64aeac5-…', '35e24f32-…']
+```
+
+- **What `broken` proves:** the write path fails **closed**. A filter that
+  cannot answer has said nothing about any of the facts, so none may stay.
+  Rejecting everything loses benign memory; keeping everything loses the
+  guarantee the filter was added to provide. This used to fail *open* — keep
+  everything, log a warning — so a crashed PII scanner meant the SSN was stored
+  while the operator believed it was filtered.
+
+> **Read the ERROR lines: the filter does not prevent the write.** mem0 fuses
+> extraction and storage, so by the time these texts exist they are already in
+> the vector store; rejection is a *delete*, not a veto. Against Milvus that
+> delete races write-visibility and **loses often** — in the run above the SSN
+> fact was rejected and then *not deleted*, and it was still searchable minutes
+> later. Retrying the same id long after the write returned `True` and removed
+> it, so the row is not permanently undeletable; the immediate delete simply
+> lost the race.
+>
+> This is why a failed delete is now reported at ERROR naming the id
+> (`session/client.py` — `if ok is False:`). `Mem0Provider.delete` catches its
+> own exceptions and returns `False`, so watching only for a raise counted a
+> failed delete as a success and told `on_stored` the fact was removed. Treat
+> `pre_store_filter` as **damage control with an audit trail, not prevention**.
+> For content that must never be written, use `infer=False` so nothing is
+> extracted in the first place.
+
 #### What this layer does and doesn't cover
 
 - **Covers:** the write-time stamp, recall re-tainting a clean run, selective
   fencing, the action gate firing from stored provenance, both label postures
-  side by side, all three `on_labeled_recall` modes, the review workflow, and
-  the inert-mechanism warning — live, with a clean-vs-labelled contrast for each.
+  side by side, all three `on_labeled_recall` modes, the review workflow, the
+  inert-mechanism warning, and all three `pre_store_filter` modes including
+  failing closed — live, with a clean-vs-labelled contrast for each.
 - **Doesn't cover:** hidden-character stripping (needs a `web_lookup` result
-  carrying invisible codepoints), and `pre_store_filter` failing closed (the
-  clinic wires no filter). Both are covered by unit tests; neither is reachable
-  from this UI as it stands.
+  carrying invisible codepoints). `strip_hidden_chars` is wired on the write
+  path at `memory/client.py`, but nothing in this UI produces a result carrying
+  them, so it is covered by unit tests only.
 - **The payload is benign.** `WEB_POISON=1` makes `web_lookup` return a planted
   instruction, but mem0's default extractor discards assistant content, so the
   poison never becomes a row on the automatic path. Reaching that needs one of:
@@ -1401,6 +1459,15 @@ what keying by server buys, and it is only observable with two of them.
 | 5      | `SessionService.save_messages` short-term gate (`session` resource, explicit `data_labels`) → placeholder       |
 | 6      | `agent/utils/validation_utils.apply_output_scanners` (runner finalizer + streaming) — NOT a data-label gate     |
 | (fork) | `DecisionStep.data_labels` + `runner.fork` seeding — not wired in this project                                  |
+| BM1    | provenance stamp in `MemoryClient.add` (`PROVENANCE_LABELS_KEY: sorted(eff_labels)`) — a sorted list, not a set, to survive the JSON round trip |
+| BM2    | `_row_provenance_labels` + `context.taint(*...)` in `MemoryService` — the taint producer that needs no declaration |
+| BM3    | `_render_memory_context` in `message_builder` (splits clean/untrusted) + `fence_untrusted(body, MEMORY_TAG)` under `MEMORY_INSTRUCTION` |
+| BM4    | same gate as Test 2 — `ToolExecutor.execute_tool_call` folds `data_labels` into the policy subjects; here the labels came from storage, not a tool |
+| BM5    | `MemoryClient._enforce_memory_policy` checking `memory:{operation}:{scope}` then the legacy `memory:{scope}` — one gate, both directions |
+| BM6    | the `on_labeled_recall` branch in `MemoryService` (fence / drop / `raise MemoryReviewRequiredError`) |
+| BM7    | `MemoryClient.mark_reviewed` (pops `PROVENANCE_LABELS_KEY`, writes `REVIEWED_KEY`) + `POST /memory/approve` in `web.py` |
+| BM8    | `MemoryService._warn_if_provenance_undeclared` — once per agent, not per turn |
+| BM9    | the `pre_store_filter` block in `SessionClient._store_in_memory`: fail-closed on a raising filter, then `if ok is False:` on each delete |
 | C1     | `MCPServer._check_tool_digests` + `_cache_dirty` reset in `connect()` (drift after approval)                    |
 | C2     | `PolicyStore.default_deny` tool gate + `_clean_tool` hidden-char stripping + `format_tool_catalog` review output |
 | C3     | `ToolTrustConfig(on_unreviewed=, on_drift=)` via `MCPServer._apply_trust_policy` (drops drifted/unapproved tools before the prompt) |

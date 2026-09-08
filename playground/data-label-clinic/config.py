@@ -279,11 +279,21 @@ def _pii_pre_store_filter(facts: list[str]) -> list[str]:
     A ``pre_store_filter`` sees the facts mem0 extracted and returns the ones
     allowed to remain. The name promises a gate before the write and there is
     not one: mem0 fuses extraction and storage, so by the time these texts exist
-    they are already in the vector store and the rejects are deleted. Measured
-    against a live Milvus, a rejected fact is searchable for roughly 280ms.
+    they are already in the vector store, and rejecting one is a *delete* rather
+    than a veto.
 
-    Treat it as damage control, not prevention. What it does buy is a record and
-    a deletion; what it cannot buy is the fact never having been written.
+    That delete races Milvus's write visibility and loses more often than the
+    earlier "searchable for roughly 280ms" note here suggested. Measured live:
+    the SSN fact was rejected and the immediate delete FAILED, and it was still
+    searchable minutes later; retrying the same id long afterwards returned True
+    and removed it. So the row is not permanently undeletable -- the delete
+    issued milliseconds after the write simply loses, and how long the fact
+    stays depends on whether anyone acts on the ERROR naming its id.
+
+    Treat it as damage control with an audit trail, not prevention. What it buys
+    is a record and an attempted deletion; what it cannot buy is the fact never
+    having been written. Use ``infer=False`` for content that must never be
+    stored at all.
     """
     return [f for f in facts if not _SSN_RE.search(f)]
 
