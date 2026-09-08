@@ -840,8 +840,22 @@ class SessionClient:
                         if not fact_id:
                             undeletable.append("<no id>")
                             continue
+                        # Two failure signals, not one. Mem0Provider.delete
+                        # catches its own exceptions and returns False, so a
+                        # delete can fail without raising -- and watching only
+                        # for an exception reintroduced the very bug this path
+                        # exists to prevent, one layer up. Seen live: mem0 raised
+                        # "list index out of range" deleting a row written
+                        # milliseconds earlier, the provider logged it, returned
+                        # False, and the rejected fact was still searchable ten
+                        # seconds later while on_stored called it removed.
+                        #
+                        # `is False` rather than `not ok`: a provider that
+                        # returns None is using the ordinary Python shape for
+                        # "did it", and treating that as failure would report
+                        # every successful delete as still stored.
                         try:
-                            await self.memory_client.delete(fact_id)
+                            ok = await self.memory_client.delete(fact_id)
                         except Exception as de:
                             logger.error(
                                 "Rejected fact %s could not be deleted (%s: %s) — it REMAINS in "
@@ -851,6 +865,14 @@ class SessionClient:
                                 de,
                             )
                             undeletable.append(fact_id)
+                        else:
+                            if ok is False:
+                                logger.error(
+                                    "Rejected fact %s was not deleted (the provider reported "
+                                    "failure) — it REMAINS in long-term memory",
+                                    fact_id,
+                                )
+                                undeletable.append(fact_id)
 
                     if undeletable:
                         logger.error(

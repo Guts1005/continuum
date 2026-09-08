@@ -404,3 +404,79 @@ class TestFilterHappyPathUnchanged:
         await client.add_message("sess-1234abcd", _msg(), on_stored=stored.append)
         assert not mem.delete.await_args_list
         assert stored == [["a"]]
+
+
+class TestFalsyDeleteCountsAsFailure:
+    """``MemoryClient.delete`` reports failure two ways.
+
+    Mem0Provider catches its own exceptions and returns False, so a delete can
+    fail without raising. Checking only for an exception meant a rejected fact
+    was pruned from `stored_pairs` -- reported to on_stored as removed -- while
+    the row stayed in the vector store. That is the precise bug this whole path
+    exists to prevent, reintroduced one layer up by watching the wrong signal.
+
+    Seen live: mem0 raised "list index out of range" deleting a row written
+    milliseconds earlier, the provider logged it and returned False, and the
+    fact the filter had rejected was still searchable ten seconds later.
+    """
+
+    async def test_falsy_delete_is_reported_as_still_stored(self):
+        from continuum.session import client as sc_mod
+
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("drop", "id-2"))
+        )
+        mem.delete = AsyncMock(return_value=False)  # failed, but did not raise
+
+        with patch.object(sc_mod.logger, "error") as err:
+            await client.add_message("sess-1234abcd", _msg(), pre_store_filter=lambda _t: [])
+
+        assert err.called, "a delete that returned False must be reported"
+
+    async def test_falsy_delete_keeps_the_fact_in_on_stored(self):
+        stored: list[list[str]] = []
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("keep", "id-1"), _fact("drop", "id-2"))
+        )
+        mem.delete = AsyncMock(return_value=False)
+
+        await client.add_message(
+            "sess-1234abcd",
+            _msg(),
+            pre_store_filter=lambda texts: [t for t in texts if t == "keep"],
+            on_stored=stored.append,
+        )
+
+        assert stored, "on_stored should still fire"
+        assert "drop" in stored[0], "the row is still in the store, so say so"
+
+    async def test_truthy_delete_still_counts_as_removed(self):
+        stored: list[list[str]] = []
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("keep", "id-1"), _fact("drop", "id-2"))
+        )
+        mem.delete = AsyncMock(return_value=True)
+
+        await client.add_message(
+            "sess-1234abcd",
+            _msg(),
+            pre_store_filter=lambda texts: [t for t in texts if t == "keep"],
+            on_stored=stored.append,
+        )
+
+        assert stored == [["keep"]]
+
+    async def test_none_return_is_not_treated_as_failure(self):
+        """A provider that returns nothing at all is the common Python shape for
+        "did it"; only an explicitly falsy non-None result means failure."""
+        stored: list[list[str]] = []
+        client, mem, _, _ = _make_client(
+            mode="sync", add_mock=_add_returning(_fact("drop", "id-2"))
+        )
+        mem.delete = AsyncMock(return_value=None)
+
+        await client.add_message(
+            "sess-1234abcd", _msg(), pre_store_filter=lambda _t: [], on_stored=stored.append
+        )
+
+        assert stored == [] or stored == [[]]
