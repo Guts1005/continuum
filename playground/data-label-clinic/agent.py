@@ -664,8 +664,23 @@ class ClinicAgent:
     ) -> dict[str, Any]:
         """Demonstrate the MEMORY-WRITE gate: try to persist `text` to the USER
         scope carrying `labels`. With PHI the policy ``phi-never-persisted``
-        (memory:*) denies it; without labels it is stored and becomes visible in
-        the long-term-memory panel.
+        (``memory:write:*``) denies it; without labels it is stored and becomes
+        visible in the long-term-memory panel.
+
+        ``infer=False``: store the text verbatim instead of asking mem0's
+        extractor to derive facts from it. Two reasons, and the second is the
+        one that matters.
+
+        The panel then shows what was actually submitted rather than an LLM
+        paraphrase of it, which is what a button labelled "save note" should
+        mean.
+
+        And it is the only setting under which hidden-character stripping can be
+        observed at all (BM10). With extraction on, the model rewrites the text,
+        so the stored row comes back free of invisible codepoints whether or not
+        ``strip_hidden_chars`` ever ran -- the payload is laundered by the
+        paraphrase and the test passes vacuously. Verbatim storage is what makes
+        the check falsifiable.
 
         Only meaningful when memory is enabled (needs mem0 + a vector store);
         otherwise we report skipped — the gate runs after _ensure_enabled().
@@ -684,6 +699,7 @@ class ClinicAgent:
                 policy_store=self._policy_store,
                 subject=self.config.agent_name,
                 data_labels=set(labels),
+                infer=False,
             )
             return {"ok": True, "denied": False, "stored": text}
         except MemoryAccessDeniedError as e:
