@@ -133,7 +133,13 @@ class TestClinicPolicyIsFailClosed:
             "llm:gpt-4o": "phi-no-cloud-model",
             "tool:clinic__send_referral_email": "phi-no-exfiltration-tools",
             "tool:clinic__web_lookup": "phi-no-exfiltration-tools",
-            "memory:alice": "phi-never-persisted",
+            # The write form, not the bare one. Reads and writes used to check
+            # the same string, so `memory:*` covered both -- and a rule whose
+            # own message says "must not be *written*" silently denied recall
+            # too. `phi-never-persisted` now names `memory:write:*`, and the
+            # read is asserted separately below as still ALLOWED, because that
+            # distinction is the point.
+            "memory:write:alice": "phi-never-persisted",
             "telemetry": "phi-redact-telemetry",
             "session": "phi-no-short-term",
         }
@@ -141,6 +147,19 @@ class TestClinicPolicyIsFailClosed:
             decision = store.check(subjects, resource)
             assert decision.allowed is False, resource
             assert decision.policy_name == policy_name, (resource, decision.policy_name)
+
+    def test_phi_run_may_still_read_memory(self, store, agent_subject):
+        """The other half of the write/read split, and the regression guard.
+
+        `phi-never-persisted` means "never stored", not "never recalled". A PHI
+        run legitimately reads the user's ordinary preferences; what it must not
+        do is add to them. Asserting only the deny would let a future rule
+        broaden back to `memory:*` unnoticed -- the read gate is silent when it
+        over-fires, because the turn just proceeds with no memories.
+        """
+        phi = _load("config").PHI
+
+        assert store.check([agent_subject, phi], "memory:read:alice").allowed is True
 
     def test_phi_run_may_still_use_the_onprem_model(self, store, agent_subject):
         """The deny is exact-match on the cloud tier; the fallback must survive."""

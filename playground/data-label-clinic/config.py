@@ -273,6 +273,53 @@ def mask_ssn(prompt: str, content: str) -> tuple[str, bool, str | None]:
     return masked, changed, ("ssn" if changed else None)
 
 
+def _pii_pre_store_filter(facts: list[str]) -> list[str]:
+    """Keep only the extracted facts that carry no SSN.
+
+    A ``pre_store_filter`` sees the facts mem0 extracted and returns the ones
+    allowed to remain. The name promises a gate before the write and there is
+    not one: mem0 fuses extraction and storage, so by the time these texts exist
+    they are already in the vector store and the rejects are deleted. Measured
+    against a live Milvus, a rejected fact is searchable for roughly 280ms.
+
+    Treat it as damage control, not prevention. What it does buy is a record and
+    a deletion; what it cannot buy is the fact never having been written.
+    """
+    return [f for f in facts if not _SSN_RE.search(f)]
+
+
+def _broken_pre_store_filter(facts: list[str]) -> list[str]:
+    """A filter that cannot answer, for CLINIC_FILTER=broken.
+
+    Stands in for the realistic failure: a scanner behind an HTTP call, a
+    classifier that OOMs, a regex that blows up on one input. The interesting
+    question is what the write path does when the thing meant to exclude content
+    is unavailable, and the answer used to be "keep everything" -- logged at
+    warning, so the facts the filter existed to remove stayed permanently.
+    """
+    raise RuntimeError("PII scanner unavailable")
+
+
+def build_pre_store_filter() -> Callable[[list[str]], list[str]] | None:
+    """CLINIC_FILTER selects the memory-write content filter.
+
+    off (default) -- no filter. Nothing is examined and everything mem0
+        extracted is kept. This is the shipped default across the SDK: no
+        detector, no guesses. Absence of a filter is not a failure to fail
+        closed -- there is no rule to be safe about.
+    pii -- drop any extracted fact containing an SSN.
+    broken -- a filter that raises, to show the write path failing CLOSED:
+        every fact from that write is rejected and deleted, and it is reported
+        at ERROR rather than whispered at warning.
+    """
+    mode = os.environ.get("CLINIC_FILTER", "off")
+    if mode == "pii":
+        return _pii_pre_store_filter
+    if mode == "broken":
+        return _broken_pre_store_filter
+    return None
+
+
 @dataclass
 class ClinicConfig:
     # Two servers, because one cannot show what namespacing is for. They overlap

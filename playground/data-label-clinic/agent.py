@@ -28,7 +28,13 @@ from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
-from config import PHI, ClinicConfig, build_policy_store, default_config
+from config import (
+    PHI,
+    ClinicConfig,
+    build_policy_store,
+    build_pre_store_filter,
+    default_config,
+)
 
 from continuum import (
     AgentConfig,
@@ -281,6 +287,10 @@ class ClinicAgent:
                 # what a recalled row carrying provenance does (F6): fence it,
                 # drop it, or refuse the turn until a person reviews it.
                 on_labeled_recall=self.config.recall_action,
+                # CLINIC_FILTER: content filter over the facts mem0 extracted.
+                # Off by default -- the SDK ships no detector. See
+                # config.build_pre_store_filter for what each mode shows.
+                pre_store_filter=build_pre_store_filter(),
             ),
             config=AgentConfig(
                 max_turns=self.config.max_turns,
