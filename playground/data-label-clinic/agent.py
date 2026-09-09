@@ -140,7 +140,7 @@ def build_mcp_servers(*, config: ClinicConfig | None = None) -> list[MCPServer]:
     rather than CLI flags, applied one level up.
 
     CLINIC_PIN_GATE=1 upgrades both trust knobs from "report it" to "drop it"
-    (TESTING_GUIDE.md Layer C, scenario C3). Reporting is the default because a
+    (F3-server-trust.md, scenario C3). Reporting is the default because a
     description a developer edited on purpose is the common case.
     """
     cfg = config or default_config
@@ -248,7 +248,7 @@ class ClinicAgent:
         everything callable.
         """
         # CLINIC_PIN_GATE=1 upgrades drift from "report it" to "drop the tool"
-        # (TESTING_GUIDE.md Layer C, scenario C3). Reporting is the default
+        # (F3-server-trust.md, scenario C3). Reporting is the default
         # because a description a developer edited on purpose is the common
         # case; dropping is what you want once the catalogue is one you trust.
         self._mcp_servers = build_mcp_servers(config=self.config)

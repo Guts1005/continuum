@@ -186,7 +186,7 @@ class TestClinicPolicyIsFailClosed:
 class TestClinicPoisonedServerMode:
     """server.py serves a hostile catalogue under CLINIC_POISON=1.
 
-    Layer B (TESTING_GUIDE.md) drives the two live scenarios from this switch:
+    Layer B (labels-and-policy.md) drives the two live scenarios from this switch:
     pin clean then poison (drift detected), or pin already-poisoned (no drift --
     the limit).
     """
@@ -264,7 +264,7 @@ def _as_tool(name: str, description: str) -> Tool:
 
 
 class TestTestingGuideCommandsAreRunnable:
-    """Every `python X.py` in TESTING_GUIDE.md must name a runnable script.
+    """Every `python X.py` in the clinic's guides must name a runnable script.
 
     The guide first shipped saying `python agent.py`, but agent.py is a library
     module with no __main__ block -- it imports, defines a class, and exits
@@ -278,8 +278,11 @@ class TestTestingGuideCommandsAreRunnable:
     def _guide_commands(self) -> set[str]:
         import re
 
-        text = (CLINIC_DIR / "TESTING_GUIDE.md").read_text()
-        return set(re.findall(r"^\s*(?:[A-Z_]+=\S+\s+)?python (\S+\.py)", text, re.MULTILINE))
+        # Every guide, not just the hub. The guide was one file until it was
+        # split into five; scanning only TESTING_GUIDE.md would have kept this
+        # test green while every command it guards moved out from under it.
+        text = "\n".join(f.read_text() for f in sorted(CLINIC_DIR.glob("*.md")))
+        return set(re.findall(r"^\s*(?:[A-Z_]+=\S+\s+)*python3? (\S+\.py)", text, re.MULTILINE))
 
     def test_the_scan_finds_commands(self):
         """A silently-empty scan reads exactly like a clean one."""

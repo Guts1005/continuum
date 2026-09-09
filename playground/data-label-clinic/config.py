@@ -444,7 +444,7 @@ class ClinicConfig:
     # warning saying so, because the same shortcut applied to a tool you did not
     # mean produces a label that blocks work nobody intended to block. Swap this
     # for {"lookup_patient": {PHI}} to see that warning (TESTING_GUIDE.md
-    # Layer D).
+    # namespacing.md).
     tool_data_labels: dict[str, set[str]] = field(
         default_factory=lambda: {
             "clinic__lookup_patient": {PHI},
