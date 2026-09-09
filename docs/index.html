@@ -1458,6 +1458,18 @@ SESSION_TTL_SECONDS=172800
 SESSION_MAX_MESSAGES=1000
 SESSION_KEY_PREFIX=orchestrator:session
 
+<span class="cm"># ── Session Ownership and Security ────────────────────────────────────────────</span>
+<span class="cm"># A session id names storage, not the caller. See Components → Sessions.</span>
+SESSION_OWNERSHIP=enforce                  <span class="cm"># open | audit | enforce(default)</span>
+SESSION_REQUIRE_PRINCIPAL=false            <span class="cm"># true | false(default)</span>
+SESSION_HASH_IDS=false                     <span class="cm"># true | false(default), opaque vs plaintext keys</span>
+SESSION_ID_SECRET=CHANGEME_generate_with_openssl_rand_hex_32
+<span class="cm">#</span>
+<span class="cm"># The three above are the compatible defaults. For a multi-tenant deployment set</span>
+<span class="cm"># SESSION_REQUIRE_PRINCIPAL=true and SESSION_HASH_IDS=true — and replace the</span>
+<span class="cm"># secret first (openssl rand -hex 32), because hashing refuses to start on a</span>
+<span class="cm"># CHANGEME placeholder.</span>
+
 <span class="cm"># ── Langfuse Observability ────────────────────────────────────────────────────</span>
 LANGFUSE_ENABLED=true
 LANGFUSE_PUBLIC_KEY=your-langfuse-public-key
@@ -2885,9 +2897,9 @@ results = <span class="kw">await</span> memory.search(<span class="str">"user pr
   <h2>Sessions (Redis)</h2>
   <p>Short-term conversation history stored in Redis. <code>AgentRunner</code> handles loading and saving automatically — you only use <code>SessionClient</code> directly when you need to manage sessions outside a run (e.g. building a chat history UI, clearing history, debugging).</p>
   <p>Persistence initializes <strong>lazily</strong> — no connection is attempted (and no warnings logged) until the first session op, so a disabled or unconfigured Redis costs nothing. If Redis is unreachable, the client degrades to a non-durable in-memory store and keeps serving with a single warning instead of an error per request. Which you want is a choice: <code>degrade</code> (the default) keeps the app running through the outage, while <code>fail</code> raises instead — surfacing the error loudly so you can catch and debug it. Set <code>SESSION_FALLBACK_MODE</code> to opt in; it defaults to <code>degrade</code>. Either way the fallback flips a <code>session_persistence</code> health check to <code>degraded</code> and a <code>session_persistence_degraded</code> gauge to <code>1.0</code> for alerting.</p>
-  <p><strong>Ownership.</strong> A session id names storage — it is not proof of who is calling. When a session records a <code>user_id</code>, the caller must have bound a matching principal or the read is refused with <code>SessionOwnershipError</code>. Bind it once where you authenticate, using <code>bind_principal()</code>; <code>AgentRunner</code>, <code>LLMClient</code> and <code>SessionClient</code> all inherit it without an argument being threaded through. Bind an id you <em>verified</em> — one the caller supplied compares an attacker-controlled value against itself. Sessions created without a <code>user_id</code> have no owner and need no principal, so anonymous and single-user apps are unaffected. Upgrading an app that does not bind one yet? <code>SESSION_OWNERSHIP=audit</code> reports what enforcement would refuse without refusing it, so you can measure the impact before taking it.</p>
+  <p><strong>Ownership.</strong> A session id names storage — it is not proof of who is calling. When a session records a <code>user_id</code>, the caller must have bound a matching principal or the read is refused with <code>SessionOwnershipError</code>. Bind it once where you authenticate, using <code>bind_principal()</code>; <code>AgentRunner</code>, <code>LLMClient</code> and <code>SessionClient</code> all inherit it without an argument being threaded through. Bind an id you <em>verified</em> — one the caller supplied compares an attacker-controlled value against itself. Sessions created without a <code>user_id</code> have no owner and need no principal, so anonymous and single-user apps are unaffected. Upgrading an app that does not bind one yet? <code>SESSION_OWNERSHIP=audit</code> lets you measure the impact before taking it.</p>
   <p><strong>What the defaults do not stop.</strong> <code>SESSION_REQUIRE_PRINCIPAL</code> ships <em>off</em>, so a caller who names nobody is let through — the compatibility choice, since every application written before <code>bind_principal()</code> existed is in that position. <code>enforce</code> does not cover it: that refuses a caller who gives the <em>wrong</em> identity, not one who gives <em>none</em>. Combined with plaintext ids (below), anyone who knows a user id can construct their session id and present it while naming nobody. Before running multi-tenant, turn on either <code>SESSION_REQUIRE_PRINCIPAL=true</code> or <code>SESSION_HASH_IDS=true</code> — either one closes that path.</p>
-  <p><strong>Opaque ids.</strong> By default a session id is built in plaintext from the identifiers it scopes — <code>u:{user_id}</code> — so anyone who knows a user id can <em>construct</em> it. Ownership checking is what stops them using it; <code>SESSION_HASH_IDS=true</code> stops them naming it at all, and keeps user identifiers out of Redis keys, log lines and traces. Recommended for multi-tenant deployments, and doing real work if you have relaxed <code>SESSION_REQUIRE_PRINCIPAL</code> while migrating. It needs <code>SESSION_ID_SECRET</code> (<code>openssl rand -hex 32</code>) — startup fails without one rather than falling back to plaintext, and weak or placeholder values are refused. The secret is a derivation parameter, not a per-process random: it must be <em>identical in every process</em> (a per-worker value splits one user's history across workers) and <em>stable across restarts</em> (changing it re-derives every id). Determinism is preserved — the same identifiers still resolve to the same session — and existing plaintext sessions migrate to their new keys on first access.</p>
+  <p><strong>Opaque ids.</strong> By default a session id is built in plaintext from the identifiers it scopes, so anyone who knows a user id can <em>construct</em> it. Ownership checking is what stops them using it; hashing stops them naming it at all. Recommended for multi-tenant deployments, and doing real work if you have relaxed <code>SESSION_REQUIRE_PRINCIPAL</code> while migrating. It needs <code>SESSION_ID_SECRET</code> (<code>openssl rand -hex 32</code>) — startup fails without one rather than falling back to plaintext, and weak or placeholder values are refused. The secret is a derivation parameter, not a per-process random: it must be <em>identical in every process</em> (a per-worker value splits one user's history across workers) and <em>stable across restarts</em> (changing it re-derives every id). Determinism is preserved — the same identifiers still resolve to the same session — and existing plaintext sessions migrate to their new keys on first access.</p>
 <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="kw">from</span> continuum.session <span class="kw">import</span> <span class="cls">SessionClient</span>, bind_principal
 
 session = <span class="cls">SessionClient</span>()
@@ -2907,6 +2919,28 @@ session = <span class="cls">SessionClient</span>()
 
     <span class="cm"># Delete the session entirely</span>
     <span class="kw">await</span> session.delete_session(session_id)</pre></div>
+
+  <h3>Settings</h3>
+  <table>
+    <tr><th>Setting</th><th>Value</th><th>What it does</th></tr>
+    <tr><td rowspan="3"><code>SESSION_OWNERSHIP</code></td><td><code>open</code></td><td>Log the problem quietly, allow the call</td></tr>
+    <tr><td><code>audit</code></td><td>Log a warning and emit a metric, allow the call — measure before enforcing</td></tr>
+    <tr><td><code>enforce</code> (default)</td><td>Raise <code>SessionOwnershipError</code></td></tr>
+    <tr><td rowspan="2"><code>SESSION_REQUIRE_PRINCIPAL</code></td><td><code>true</code></td><td>A caller who names nobody is refused</td></tr>
+    <tr><td><code>false</code> (default)</td><td>Holding the session id is enough</td></tr>
+    <tr><td rowspan="2"><code>SESSION_HASH_IDS</code></td><td><code>true</code></td><td>Ids are <code>s_&lt;hex&gt;</code> — not derivable, and no user ids in Redis keys or logs</td></tr>
+    <tr><td><code>false</code> (default)</td><td>Ids are <code>u:{user_id}</code> — readable, and constructible by anyone who knows a user id</td></tr>
+    <tr><td><code>SESSION_ID_SECRET</code></td><td>a random string</td><td>HMAC key. Required when hashing is on; short, memorable and placeholder values are refused at startup</td></tr>
+  </table>
+
+  <p>The defaults above are the compatible ones, so that upgrading an existing application does not break it. For a multi-tenant deployment, set all three:</p>
+<div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="cm"># Session Ownership and Security</span>
+SESSION_OWNERSHIP=enforce           <span class="cm"># refuse a caller whose identity does not match</span>
+SESSION_REQUIRE_PRINCIPAL=true      <span class="cm"># and one who gives no identity at all</span>
+SESSION_HASH_IDS=true               <span class="cm"># ids become s_&lt;hex&gt;; re-derives existing keys</span>
+
+<span class="cm"># generate with: openssl rand -hex 32</span>
+SESSION_ID_SECRET=…</pre></div>
 
   <a class="anchor" id="comp-temporal"></a>
   <h2>Temporal Integration</h2>

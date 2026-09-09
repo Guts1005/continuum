@@ -436,12 +436,28 @@ single-user deployments are unaffected.
 
 ### Settings
 
-| Variable | Default | Meaning |
+| Variable | Value | What it does |
 |---|---|---|
-| `SESSION_OWNERSHIP` | `enforce` | `open` logs quietly and allows; `audit` logs a warning plus a metric and allows; `enforce` raises |
-| `SESSION_REQUIRE_PRINCIPAL` | `false` | Whether "no principal bound" is itself a problem. Off for compatibility — turn it on, or turn on hashing, before running multi-tenant |
-| `SESSION_HASH_IDS` | `false` | Derive ids as an HMAC rather than plaintext |
-| `SESSION_ID_SECRET` | — | HMAC key; required when `SESSION_HASH_IDS=true` |
+| `SESSION_OWNERSHIP` | `open` | Log the problem quietly, allow the call |
+| | `audit` | Log a warning and emit a metric, allow the call — measure before enforcing |
+| | `enforce` *(default)* | Raise `SessionOwnershipError` |
+| `SESSION_REQUIRE_PRINCIPAL` | `true` | A caller who names nobody is refused |
+| | `false` *(default)* | Holding the session id is enough |
+| `SESSION_HASH_IDS` | `true` | Ids are `s_<hex>` — not derivable, and no user ids in Redis keys or logs |
+| | `false` *(default)* | Ids are `u:{user_id}` — readable, and constructible by anyone who knows a user id |
+| `SESSION_ID_SECRET` | a random string | HMAC key. Required when hashing is on; short, memorable and placeholder values are refused at startup |
+
+The defaults are the compatible ones, so that upgrading an existing application
+does not break it. For a multi-tenant deployment, set all three:
+
+```bash
+SESSION_OWNERSHIP=enforce           # refuse a caller whose identity does not match
+SESSION_REQUIRE_PRINCIPAL=true      # and one who gives no identity at all
+SESSION_HASH_IDS=true               # ids become s_<hex>; re-derives existing keys
+
+# generate with: openssl rand -hex 32
+SESSION_ID_SECRET=…
+```
 
 ### Upgrading an existing application
 
