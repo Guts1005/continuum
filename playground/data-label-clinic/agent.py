@@ -102,7 +102,7 @@ def build_trust_config(*, strict: bool = False) -> ToolTrustConfig:
         #
         # Non-strict is "warn", not the SDK default of "block": a fresh clone
         # has no tool-pins.json and this is a demo people should be able to
-        # start before reading TESTING_GUIDE.md. Not "allow" either -- being
+        # start before reading docs/TESTING_GUIDE.md. Not "allow" either -- being
         # told the catalogue is unreviewed is the right first thing to see.
         on_unreviewed="block" if strict else "warn",
         on_drift="block" if strict else "warn",
@@ -140,7 +140,7 @@ def build_mcp_servers(*, config: ClinicConfig | None = None) -> list[MCPServer]:
     rather than CLI flags, applied one level up.
 
     CLINIC_PIN_GATE=1 upgrades both trust knobs from "report it" to "drop it"
-    (F3-server-trust.md, scenario C3). Reporting is the default because a
+    (docs/F3-server-trust.md, scenario C3). Reporting is the default because a
     description a developer edited on purpose is the common case.
     """
     cfg = config or default_config
@@ -248,7 +248,7 @@ class ClinicAgent:
         everything callable.
         """
         # CLINIC_PIN_GATE=1 upgrades drift from "report it" to "drop the tool"
-        # (F3-server-trust.md, scenario C3). Reporting is the default
+        # (docs/F3-server-trust.md, scenario C3). Reporting is the default
         # because a description a developer edited on purpose is the common
         # case; dropping is what you want once the catalogue is one you trust.
         self._mcp_servers = build_mcp_servers(config=self.config)

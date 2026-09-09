@@ -186,7 +186,7 @@ class TestClinicPolicyIsFailClosed:
 class TestClinicPoisonedServerMode:
     """server.py serves a hostile catalogue under CLINIC_POISON=1.
 
-    Layer B (labels-and-policy.md) drives the two live scenarios from this switch:
+    Layer B (docs/labels-and-policy.md) drives the two live scenarios from this switch:
     pin clean then poison (drift detected), or pin already-poisoned (no drift --
     the limit).
     """
@@ -278,10 +278,16 @@ class TestTestingGuideCommandsAreRunnable:
     def _guide_commands(self) -> set[str]:
         import re
 
-        # Every guide, not just the hub. The guide was one file until it was
-        # split into five; scanning only TESTING_GUIDE.md would have kept this
-        # test green while every command it guards moved out from under it.
-        text = "\n".join(f.read_text() for f in sorted(CLINIC_DIR.glob("*.md")))
+        # README plus every guide. Two reasons the scope is spelled out rather
+        # than globbed loosely: the guide was one file until it was split into
+        # five, so scanning only the hub would have left this green while the
+        # commands moved out from under it -- and README carries commands too,
+        # which is why the "found nothing" tripwire below could NOT have caught
+        # the move on its own. Measured: a stale top-level *.md glob still
+        # returns four commands from README while missing the two live scripts
+        # documented under docs/.
+        sources = [CLINIC_DIR / "README.md", *sorted((CLINIC_DIR / "docs").glob("*.md"))]
+        text = "\n".join(f.read_text() for f in sources if f.exists())
         return set(re.findall(r"^\s*(?:[A-Z_]+=\S+\s+)*python3? (\S+\.py)", text, re.MULTILINE))
 
     def test_the_scan_finds_commands(self):
@@ -383,7 +389,7 @@ class TestClinicTrustConfig:
 
         The SDK blocks unreviewed servers by default, which is right for an
         application and wrong for a demo people should be able to run before
-        reading TESTING_GUIDE.md. "warn" rather than "allow" so it still says
+        reading docs/TESTING_GUIDE.md. "warn" rather than "allow" so it still says
         so -- for a teaching demo, being told the catalogue is unreviewed is
         the right first thing to see.
         """
@@ -410,7 +416,7 @@ class TestClinicTrustConfig:
     def test_the_env_var_actually_reaches_the_server(self):
         """The switch must be wired, not merely defined.
 
-        Scenario C3 in TESTING_GUIDE.md depends on trust_config being passed
+        Scenario C3 in docs/F3-server-trust.md depends on trust_config being passed
         and on its strictness being derived from CLINIC_PIN_GATE -- a hardcoded
         call would make the env var inert while still looking configured.
         """

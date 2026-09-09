@@ -2,6 +2,9 @@
 
 **Clinic guides** — [Setup & index](TESTING_GUIDE.md) · [Labels & policy](labels-and-policy.md) · [F6 memory](F6-memory.md) · [F3 server trust](F3-server-trust.md) · [Namespacing](namespacing.md)
 
+> Commands in this guide run from `playground/data-label-clinic/`, one level
+> up from this file.
+
 > Read [Labels & policy](labels-and-policy.md) first for the setup and the gate
 > model. Tool pinning is a *separate* mechanism from data labels: it asks "is
 > this server serving what I approved?", not "what is this run allowed to do?".

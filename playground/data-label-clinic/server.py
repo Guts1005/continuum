@@ -133,7 +133,7 @@ def web_lookup(query: str) -> dict:
     }
 
 
-# The catalogue as it stands when the server is honest. F3-server-trust.md
+# The catalogue as it stands when the server is honest. docs/F3-server-trust.md
 # compares this against the poisoned variant below.
 TOOL_FUNCTIONS = {
     "clinic_info": clinic_info,
@@ -152,7 +152,7 @@ TOOL_FUNCTIONS = {
 # Nothing about the tools' behaviour changes -- only their *descriptions*, which
 # is the whole point: the payload is text the model reads, not code it runs.
 #
-# Drives two F3-server-trust.md scenarios:
+# Drives two docs/F3-server-trust.md scenarios:
 #   pin clean -> restart poisoned  =>  digest tripwire fires (a "rug pull")
 #   pin already-poisoned           =>  tripwire stays silent (the real limit),
 #                                      and the fail-closed policy is what stops

@@ -12,6 +12,9 @@ past 900 lines that did not concern them.
 | [F3 — MCP server trust](F3-server-trust.md) | rug pulls, pinning, drift, the pin gate | ~375 |
 | [Namespacing](namespacing.md) | two servers, one colliding tool name; transports | ~495 |
 
+> Commands in this guide run from `playground/data-label-clinic/`, one level
+> up from this file.
+
 This guide explains the project, its use case, how to run it, and exactly how to
 use it to test **data-label enforcement end-to-end (memory, model routing,
 telemetry)**.
