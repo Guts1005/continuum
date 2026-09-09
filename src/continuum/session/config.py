@@ -209,13 +209,18 @@ class SessionConfig(BaseModel):
     require_principal: bool = Field(
         default_factory=lambda: settings.session_require_principal,
         description=(
-            "Treat 'no principal bound' as an ownership problem. On by default: "
-            "an owned session should be reachable only by a caller who has said "
-            "who they are, so 'I did not identify myself' is refused rather than "
-            "waved through as capability-style access. Set False to allow it — "
-            "defensible once session ids are hashed, since an unguessable id in "
-            "a caller's hand is reasonable evidence they were given it. Sessions "
-            "with no stored owner are unaffected either way."
+            "Treat 'no principal bound' as an ownership problem. OFF by default, "
+            "for compatibility rather than for safety: every application written "
+            "before bind_principal() existed names no principal, so requiring one "
+            "would refuse each of them on upgrade. The consequence is that holding "
+            "the session id is accepted as sufficient, and with hash_session_ids "
+            "also off the id is derived in plaintext from the user id it scopes — "
+            "so anyone who knows a user id can construct it and present it while "
+            "naming nobody. session_ownership='enforce' does not cover that path: "
+            "it refuses a caller who gives the WRONG identity, not one who gives "
+            "none. Either escape closes it, and a multi-tenant deployment needs "
+            "one: set this True, or set hash_session_ids True so the id can no "
+            "longer be derived. Sessions with no stored owner are unaffected."
         ),
     )
     hash_session_ids: bool = Field(

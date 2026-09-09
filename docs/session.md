@@ -128,7 +128,7 @@ reset_global_session()                            # for tests
 | `sliding_window_trim_count` | `int` | `100` | How many oldest messages to drop |
 | `fallback_mode` | `Literal["degrade","fail"]` | `settings.session_fallback_mode` (`"degrade"`) | What to do when Redis is unreachable — see §10 |
 | `session_ownership` | `Literal["open","audit","enforce"]` | `settings.session_ownership` (`"enforce"`) | How to react when a caller touches a session owned by someone else — see §11 |
-| `require_principal` | `bool` | `settings.session_require_principal` (`True`) | Treat "no principal bound" as an ownership problem |
+| `require_principal` | `bool` | `settings.session_require_principal` (`False`) | Treat "no principal bound" as an ownership problem — see §11 |
 | `hash_session_ids` | `bool` | `settings.session_hash_ids` (`False`) | Derive session ids as an HMAC instead of plaintext — see §11 |
 | `session_id_secret` | `str \| None` | `settings.session_id_secret` | HMAC key; required when `hash_session_ids` is on |
 
@@ -409,7 +409,27 @@ async def stream():
 | none | anything | allowed — nothing to protect |
 | set | matches | allowed |
 | set | differs | `SessionOwnershipError` |
-| set | none bound | `SessionOwnershipError` (unless `require_principal=False`) |
+| set | none bound | allowed by default; `SessionOwnershipError` when `require_principal=True` |
+
+### What the defaults do not stop
+
+`require_principal` ships **off**, so a caller who names nobody is let through —
+the compatibility choice, since every application written before
+`bind_principal` existed is in exactly that position.
+
+`session_ownership="enforce"` does not cover this. It refuses a caller who gives
+the *wrong* identity, not one who gives *none*. And with `hash_session_ids` also
+off, the id is derived in plaintext from the user id it scopes, so anyone who
+knows a user id can construct their session id and present it while naming
+nobody.
+
+A multi-tenant deployment needs one of these two, and either is sufficient:
+
+```bash
+SESSION_REQUIRE_PRINCIPAL=true   # the caller must say who they are
+SESSION_HASH_IDS=true            # the id can no longer be derived
+```
+
 
 Sessions created without a `user_id` have no owner, so anonymous and
 single-user deployments are unaffected.
@@ -419,7 +439,7 @@ single-user deployments are unaffected.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SESSION_OWNERSHIP` | `enforce` | `open` logs quietly and allows; `audit` logs a warning plus a metric and allows; `enforce` raises |
-| `SESSION_REQUIRE_PRINCIPAL` | `true` | Whether "no principal bound" is itself a problem |
+| `SESSION_REQUIRE_PRINCIPAL` | `false` | Whether "no principal bound" is itself a problem. Off for compatibility — turn it on, or turn on hashing, before running multi-tenant |
 | `SESSION_HASH_IDS` | `false` | Derive ids as an HMAC rather than plaintext |
 | `SESSION_ID_SECRET` | — | HMAC key; required when `SESSION_HASH_IDS=true` |
 

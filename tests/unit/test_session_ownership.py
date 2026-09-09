@@ -401,32 +401,123 @@ class TestFixesCompose:
                 await client.get_conversation_history(real)
 
 
+@pytest.mark.asyncio
+class TestPermissiveDefaultLeavesTheOmissionPathOpen:
+    """What the shipped defaults do NOT stop, written down deliberately.
+
+    ``require_principal=False`` treats holding the session id as sufficient —
+    capability access. That is only sound when the id is hard to come by, and on
+    defaults it is not: ``hash_session_ids`` also ships off, so the id is
+    computed in plaintext from the user id it scopes. Anyone who knows a user id
+    can construct their session id and present it while naming nobody.
+
+    Both escapes close this, and a deployment needs one of them:
+
+        SESSION_REQUIRE_PRINCIPAL=true   the caller must say who they are
+        SESSION_HASH_IDS=true            the id can no longer be derived
+
+    These tests exist so that combination is a recorded property with a stated
+    remedy, rather than something discovered later in an incident.
+    """
+
+    def _client(self, **kw) -> SessionClient:
+        kw.setdefault("require_principal", False)  # the shipped value, not the local .env
+        cfg = SessionConfig(enabled=True, provider="memory", session_ownership="enforce", **kw)
+        client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
+        client.set_provider(MemorySessionProvider(cfg))
+        client._initialized = True
+        return client
+
+    async def test_a_derived_id_plus_no_principal_reaches_the_session(self):
+        client = self._client(hash_session_ids=False)
+        with bind_principal("alice"):
+            sid = await client.get_or_create_session(user_id="alice")
+            await client.add_message(
+                sid, ChatMessage(role="user", content="private"), store_in_memory=False
+            )
+
+        # Everything an outsider needs is alice's user id.
+        assert sid == "u:alice"
+        history = await client.get_conversation_history("u:alice")
+        assert [m.content for m in history] == ["private"]
+
+    async def test_naming_the_wrong_principal_is_still_refused(self):
+        """``enforce`` is doing something — just not this. It stops the caller
+        who volunteers an identity that does not match."""
+        client = self._client(hash_session_ids=False)
+        with bind_principal("alice"):
+            sid = await client.get_or_create_session(user_id="alice")
+
+        with bind_principal("mallory"):
+            with pytest.raises(SessionOwnershipError):
+                await client.get_conversation_history(sid)
+
+    async def test_requiring_a_principal_closes_it(self):
+        client = self._client(hash_session_ids=False, require_principal=True)
+        with bind_principal("alice"):
+            sid = await client.get_or_create_session(user_id="alice")
+
+        with pytest.raises(SessionOwnershipError):
+            await client.get_conversation_history(sid)
+
+    async def test_hashing_the_id_closes_it_too(self):
+        """The other remedy: with no principal required, the id itself has to be
+        the secret — so it must not be derivable from the user id."""
+        client = self._client(
+            hash_session_ids=True,
+            session_id_secret="d27d3f15bdd2236ac32c8333ddc38b0546f49a7db0276293b93ae4174d597641",
+        )
+        with bind_principal("alice"):
+            sid = await client.get_or_create_session(user_id="alice")
+
+        assert sid != "u:alice"
+        with pytest.raises(Exception):  # the derived id resolves to nothing
+            await client.get_conversation_history("u:alice")
+
+
 # ── the shipped defaults ──────────────────────────────────────────────────────
 
 
 class TestSecureByDefault:
-    """The defaults are the security posture.
+    """The defaults are the security posture, and these two do not say the same
+    thing.
 
-    Almost nobody changes a default, so shipping 'report but allow' would mean
-    shipping a check that, in most deployments, never refuses anything — the
-    same shape as the warning this whole change replaced. The strict setting is
-    therefore the default, and a deployment that cannot adopt principals yet
-    opts *down* deliberately rather than opting in to protection.
+    ``session_ownership=enforce`` refuses a caller who names the wrong
+    principal. ``require_principal`` decides the other case — a caller who names
+    none at all — and it ships off, so an application that has never called
+    ``bind_principal`` keeps working on upgrade.
+
+    That combination stops an attacker who identifies himself incorrectly, and
+    not one who identifies himself not at all. What closes the second path is
+    either turning ``require_principal`` on or turning ``hash_session_ids`` on,
+    since a caller cannot present an id they were never able to derive. With
+    both off, the session id is computed from the user id it scopes and holding
+    it proves nothing — see ``TestPermissiveDefaultLeavesTheOmissionPathOpen``,
+    which pins that consequence rather than leaving it implied.
     """
 
     def test_ownership_is_enforced_by_default(self):
         assert SessionConfig().session_ownership == "enforce"
 
-    def test_a_principal_is_required_by_default(self):
-        assert SessionConfig().require_principal is True
+    def test_a_principal_is_not_required_by_default(self):
+        """Off, so upgrading does not break callers that never bound one.
+
+        Asserted against the shipped field default rather than a constructed
+        instance: this repository's own .env sets the variable, and a test that
+        reads it would pass or fail on the developer's machine configuration
+        instead of on what the package ships.
+        """
+        from continuum.config import Settings
+
+        assert Settings.model_fields["session_require_principal"].default is False
 
     def test_the_underlying_settings_agree(self):
         """The pydantic field reads from settings, so both must move together —
         otherwise SESSION_OWNERSHIP would silently disagree with the code."""
-        from continuum.config import settings
+        from continuum.config import Settings
 
-        assert settings.session_ownership == "enforce"
-        assert settings.session_require_principal is True
+        assert Settings.model_fields["session_ownership"].default == "enforce"
+        assert Settings.model_fields["session_require_principal"].default is False
 
     def test_a_deployment_can_still_opt_down(self):
         """The escape hatch has to work, because the strict default is a
@@ -440,19 +531,30 @@ class TestSecureByDefault:
 class TestSecureByDefaultBehaviour:
     def _default_client(self) -> SessionClient:
         """A client on shipped defaults — nothing about ownership configured."""
-        cfg = SessionConfig(enabled=True, provider="memory", hash_session_ids=False)
+        # Pinned to the shipped defaults rather than inherited: this repo's own
+        # .env overrides them, and these tests are about what the package does
+        # out of the box.
+        cfg = SessionConfig(
+            enabled=True,
+            provider="memory",
+            session_ownership="enforce",
+            require_principal=False,
+            hash_session_ids=False,
+        )
         client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
         client.set_provider(MemorySessionProvider(cfg))
         client._initialized = True
         return client
 
-    async def test_an_owned_session_refuses_an_unidentified_caller(self):
-        """The headline consequence: holding the id is no longer enough."""
+    async def test_an_unidentified_caller_is_allowed_on_defaults(self):
+        """``require_principal`` ships off, so a caller who names nobody is let
+        through. This is the compatibility choice: every application written
+        before ``bind_principal`` existed is in exactly this position, and
+        refusing them all on upgrade would break each one."""
         client = self._default_client()
         sid = await _seed_owned_session(client, owner="alice")
 
-        with pytest.raises(SessionOwnershipError):
-            await client.get_conversation_history(sid)
+        assert await client.get_conversation_history(sid) == []
 
     async def test_the_owner_still_reaches_their_own_session(self):
         client = self._default_client()

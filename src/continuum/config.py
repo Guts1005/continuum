@@ -325,12 +325,26 @@ class Settings(BaseSettings):
     # cannot bind principals yet opts DOWN (SESSION_OWNERSHIP=open,
     # SESSION_REQUIRE_PRINCIPAL=false) rather than opting in to protection.
     session_ownership: Literal["open", "audit", "enforce"] = "enforce"
-    # Treat "no principal bound" as an ownership problem. On by default: an
-    # owned session should be reachable only by a caller who has identified
-    # themselves, so "I did not say who I am" is refused rather than waved
-    # through. Sessions with no stored owner (anonymous / single-user
-    # deployments) are unaffected either way.
-    session_require_principal: bool = True
+    # Treat "no principal bound" as an ownership problem.
+    #
+    # OFF by default, which is a compatibility choice and not a security one:
+    # every application written before bind_principal() existed names no
+    # principal, so requiring one would refuse each of them on upgrade.
+    #
+    # The consequence is worth stating plainly. With this off, holding the
+    # session id is accepted as sufficient — and on defaults SESSION_HASH_IDS is
+    # off too, so the id is computed in plaintext from the user id it scopes.
+    # Anyone who knows a user id can construct their session id and present it
+    # while naming nobody. SESSION_OWNERSHIP=enforce does not cover that path:
+    # it refuses a caller who gives the WRONG identity, not one who gives none.
+    #
+    # Either escape closes it, and a multi-tenant deployment needs one:
+    #   SESSION_REQUIRE_PRINCIPAL=true  — the caller must say who they are
+    #   SESSION_HASH_IDS=true           — the id can no longer be derived
+    #
+    # Sessions with no stored owner (anonymous / single-user deployments) are
+    # unaffected either way.
+    session_require_principal: bool = False
     # Derive session ids as an HMAC of the identifiers rather than storing them
     # in plaintext, so "u:{user_id}" can no longer be constructed by anyone who
     # knows a user id. Changes every key — see the dual-read migration in
