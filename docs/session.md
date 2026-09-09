@@ -445,18 +445,26 @@ single-user deployments are unaffected.
 
 ### Upgrading an existing application
 
-The defaults are strict, so an application that does not yet call
-`bind_principal` will see every session read and write refused. The way down:
+`require_principal` ships off, so an application that does not yet call
+`bind_principal` keeps working on upgrade. What it will hit is the *mismatch*
+case: a caller that binds an identity not matching the stored owner is refused.
+
+To see that coming rather than discover it in production:
 
 ```bash
 SESSION_OWNERSHIP=audit
-SESSION_REQUIRE_PRINCIPAL=false
 ```
 
-`audit` allows the call and reports it — log line plus a
+`audit` allows the call and reports it — a log line plus a
 `session_ownership_*` metric — so you can measure what enforcement would break
 before it breaks anything. Adopt `bind_principal` at your auth boundary, watch
-the metric fall to zero, then remove both lines.
+the metric fall to zero, then return to `enforce`.
+
+Then close the omission path, which the defaults leave open:
+
+```bash
+SESSION_REQUIRE_PRINCIPAL=true   # or SESSION_HASH_IDS=true — either one
+```
 
 ### Hashing the ids
 
