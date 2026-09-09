@@ -2337,7 +2337,7 @@ agent = <span class="cls">BaseAgent</span>(
 
   <a class="anchor" id="run-data-labels"></a>
   <h2>Data-Label Enforcement</h2>
-  <p>Make sensitivity labels such as <code>pii</code>, <code>confidential</code>, or <code>restricted</code> change what a run is <em>allowed to do</em>. A run carries a set of labels (<code>ctx.data_labels</code>); labels are added by <strong>producers</strong> and then <strong>gate</strong> six runtime sinks. Taint is monotonic (only added, propagates forward) and is enforced identically in streaming and non-streaming.</p>
+  <p>Make sensitivity labels such as <code>pii</code>, <code>confidential</code>, or <code>restricted</code> change what a run is <em>allowed to do</em>. A run carries a set of labels (<code>ctx.data_labels</code>); labels are added by <strong>producers</strong> and then <strong>gate</strong> seven runtime sinks. Taint is monotonic (only added, propagates forward) and is enforced identically in streaming and non-streaming. One further path — what to do with a <em>recalled</em> memory row that carries labels — is a config choice rather than a policy deny, covered under <em>What a labelled recall does</em> below.</p>
   <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="cm"># producer (taint) ─▶ ctx.data_labels = {"pii"} ─▶ gate at each sink (deny?)</span></pre></div>
 
   <p><strong>Independent of <a onclick="scrollToAnchor('run-safety')" style="cursor:pointer;text-decoration:underline">Input / Output Scanning</a>.</strong> Scanners <em>sanitize text</em>; data labels <em>gate behavior</em>. Neither feeds the other — a scanner never taints a run.</p>
@@ -2350,6 +2350,7 @@ agent = <span class="cls">BaseAgent</span>(
     <tr><td><code>AgentConfig.tool_data_labels</code></td><td><code>{}</code></td><td>no tool taints the run</td></tr>
     <tr><td><code>AgentMemoryConfig.scope_data_labels</code></td><td><code>{}</code></td><td>no memory-read taint</td></tr>
     <tr><td>run-level <code>data_labels</code></td><td><code>None</code></td><td>run starts clean</td></tr>
+    <tr><td><code>AgentMemoryConfig.on_labeled_recall</code></td><td><code>"fence"</code></td><td>labelled rows are fenced in the prompt, not dropped or blocked</td></tr>
     <tr><td>policy evaluation</td><td>open-default-allow</td><td>unmatched resource → allowed (opt into fail-closed via <code>PolicyStore.default_deny()</code>)</td></tr>
   </table>
 
@@ -2390,7 +2391,52 @@ store.<span class="fn">add_policy</span>(<span class="cls">AccessPolicy</span>(
 ctx = <span class="fn">create_run_context</span>(user_id=<span class="str">"u1"</span>, data_labels={<span class="str">"pii"</span>})
 
 <span class="cm"># (d) Anywhere in your own code</span>
-ctx.<span class="fn">taint</span>(<span class="str">"confidential"</span>)</pre></div>
+ctx.<span class="fn">taint</span>(<span class="str">"confidential"</span>)
+
+<span class="cm"># (e) Row provenance — NEEDS NO DECLARATION. Whatever labels a run carries are</span>
+<span class="cm">#     stamped onto every memory row it writes; recalling that row re-taints the</span>
+<span class="cm">#     reader, even a turn that calls no tool at all.</span></pre></div>
+
+  <p><strong>Row provenance needs no declaration of its own, and it is the only producer whose taint
+  crosses sessions.</strong> It is not free of the others, though: a row is only stamped if the run
+  that wrote it was already labelled by (a)-(d), so with nothing declared anywhere nothing is ever
+  stamped and this never fires. What it adds is <em>persistence</em> — (a)-(d) label a run from
+  something happening <em>now</em>, while a stamped row labels a run from something that happened
+  days ago. That is what makes memory poisoning outlive the session that planted it, and it is the
+  producer the <code>on_labeled_recall</code> setting below exists to handle.</p>
+
+  <p>The label is a property of the <em>run that stored the row</em>, not of the sentence. A user's
+  own stated preference, saved by a turn that had read a web page, carries that page's label. The
+  over-approximation is deliberate: once untrusted text is in the context window, nothing can say
+  which part of the output it shaped.</p>
+
+  <h3>What a labelled recall does</h3>
+  <p>Recall is the one path that is <strong>not</strong> a policy resource. The other sinks answer
+  "is this action allowed?"; a recalled row asks "what should be done with this text?", which no
+  deny/allow can express. It is configured on the agent instead:</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="cls">AgentMemoryConfig</span>(on_labeled_recall=<span class="str">"fence"</span>)  <span class="cm"># "fence" | "drop" | "block"</span></pre></div>
+  <table>
+    <tr><th>Value</th><th>Effect</th><th>Run taint</th></tr>
+    <tr><td><code>"fence"</code> <em>(default)</em></td><td>the row enters the prompt wrapped in <code>&lt;recalled_memory untrusted="true"&gt;</code>, under a rule that grants factual use and withholds instruction authority. Unlabelled rows stay in the plain profile block</td><td>tainted</td></tr>
+    <tr><td><code>"drop"</code></td><td>the row never reaches the prompt</td><td><strong>clean</strong> — the run did not touch it, so it must not be tainted by it</td></tr>
+    <tr><td><code>"block"</code></td><td>the turn refuses with <code>MemoryReviewRequiredError</code>, naming the offending row ids and labels</td><td>n/a — the turn does not run</td></tr>
+  </table>
+  <p><strong>Fencing is selective, and that matters.</strong> Fencing every recalled row was measured
+  and rejected: the envelope alone costs Claude its factual recall (3/3 → 0/3 on a retrieval check).
+  Only rows that provenance marks untrusted are quarantined, which is what makes the fence
+  affordable.</p>
+  <p><strong>Prompt-level framing is defence in depth, not the control.</strong> Across four models a
+  planted instruction inside the fence was refused by two and obeyed by <code>gpt-4o-mini</code> in
+  every envelope tried. The control that holds regardless is the tool gate above — set membership on
+  the run's labels, which never asks the model anything. Choose <code>"drop"</code> or
+  <code>"block"</code> if you cannot rely on the model honouring a fence.</p>
+  <p><strong><code>"block"</code> needs a review route.</strong> A blocked turn with no way to clear
+  the row is an outage, not a workflow. <code>MemoryClient.mark_reviewed(memory_id, reviewer=…)</code>
+  removes the labels and records who cleared them and when — a reviewed row stays distinguishable
+  from one nobody examined. Note the third option it creates: deleting a coarsely-labelled row loses
+  a real user preference, leaving it keeps the gate firing forever, and review is neither.</p>
+  <p><code>"fence"</code> is the default because it is the only mode where every step is observable,
+  and because changing what an existing deployment does on upgrade is not a security improvement.</p>
 
   <h3>Sink reference</h3>
   <p>Write policy <code>resources=[…]</code> using these strings. Each sink checks the policy with subjects <code>[agent.name, *sorted(labels)]</code>.</p>
@@ -2398,7 +2444,8 @@ ctx.<span class="fn">taint</span>(<span class="str">"confidential"</span>)</pre>
     <tr><th>Sink</th><th>Resource string</th><th>What a deny does</th></tr>
     <tr><td>Model routing</td><td><code>llm:&lt;model&gt;</code></td><td>raises <code>ModelAccessDeniedError</code> (catch → reroute to an allowed model)</td></tr>
     <tr><td>Tool call</td><td><code>tool:&lt;name&gt;</code> (globs). MCP tools are namespaced by default, so the resource is <code>tool:&lt;server&gt;__&lt;name&gt;</code>; local function tools keep bare names</td><td>tool result becomes <code>POLICY DENIED: …</code> (tool not run; model sees it)</td></tr>
-    <tr><td>Long-term memory</td><td><code>memory:&lt;scope&gt;</code> or <code>memory:*</code></td><td>write blocked (<code>MemoryAccessDeniedError</code> on explicit add; auto-store skipped)</td></tr>
+    <tr><td>Long-term memory — write</td><td><code>memory:write:&lt;scope&gt;</code> (globs; <code>memory:&lt;scope&gt;</code> still checked for policies predating the split)</td><td>write blocked (<code>MemoryAccessDeniedError</code> on explicit add; auto-store skipped)</td></tr>
+    <tr><td>Long-term memory — read</td><td><code>memory:read:&lt;scope&gt;</code> (same legacy fallback)</td><td>recall returns nothing; the turn proceeds without memories</td></tr>
     <tr><td>Telemetry</td><td><code>telemetry</code></td><td>payload replaced with <code>{"_redacted": "…"}</code> before egress</td></tr>
     <tr><td>Short-term session</td><td><code>session</code></td><td>assistant answer stored as a placeholder, not verbatim</td></tr>
     <tr><td>Decision trace</td><td><code>telemetry</code> (reused)</td><td>trace content redacted before persistence; audit skeleton kept</td></tr>
