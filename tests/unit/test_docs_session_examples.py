@@ -30,8 +30,25 @@ from continuum.session.providers.memory import MemorySessionProvider
 DOC = Path(__file__).resolve().parents[2] / "docs" / "session.md"
 
 
-def _client() -> SessionClient:
-    cfg = SessionConfig(enabled=True, provider="memory", hash_session_ids=False)
+def _client(*, require_principal: bool = False) -> SessionClient:
+    """A client whose ownership posture is stated, not inherited.
+
+    ``require_principal`` used to be left unset here, so it fell through to
+    ``settings.session_require_principal`` -- the environment. That made the
+    refusal test below pass on a machine whose .env set it true and fail in CI,
+    which ships it false. The test was asserting a property of the author's
+    environment.
+
+    Both values are exercised: the anonymous and history flows document what
+    happens on the shipped default, and the refusal documents what happens once
+    an operator turns it on.
+    """
+    cfg = SessionConfig(
+        enabled=True,
+        provider="memory",
+        hash_session_ids=False,
+        require_principal=require_principal,
+    )
     client = SessionClient(session_config=cfg, memory_client=None, auto_initialize=False)
     client.set_provider(MemorySessionProvider(cfg))
     client._initialized = True
@@ -96,8 +113,14 @@ class TestDocumentedFlows:
 
     async def test_the_documented_refusal(self):
         """The doc has to show what going wrong looks like, so the error it
-        names must be the error that is raised."""
-        client = _client()
+        names must be the error that is raised.
+
+        Needs ``require_principal=True`` explicitly: the refusal being
+        documented is the one an operator opts into. On shipped defaults an
+        unbound caller is allowed through, so leaving this ambient asserted
+        nothing on a default install.
+        """
+        client = _client(require_principal=True)
 
         with bind_principal("u1"):
             sid = await client.get_or_create_session(user_id="u1")
