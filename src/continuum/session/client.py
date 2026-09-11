@@ -770,7 +770,26 @@ class SessionClient:
                     conversation_id=session_metadata.conversation_id,
                     metadata=memory_metadata,
                     custom_prompt=extraction_prompt,
+                    # Handed down rather than applied to the result below: the
+                    # gate lives inside mem0's _create_memory, so a rejected fact
+                    # is never written. What remains below is the fallback for
+                    # anything that reaches the store regardless.
+                    pre_store_filter=pre_store_filter,
                 )
+
+                # Facts the gate stopped before the write. mem0's ADD branch
+                # appends a result entry whatever _create_memory returned, so
+                # these come back looking stored. Excluded here, once, so neither
+                # the delete path nor on_stored ever sees them: deleting a row
+                # that was never created fails noisily for no reason, and naming
+                # it to on_stored is the reassuring lie this whole path exists to
+                # avoid.
+                suppressed_by_gate = set(getattr(result, "suppressed", None) or [])
+                if suppressed_by_gate:
+                    logger.info(
+                        "🚫 pre_store_filter stopped %d fact(s) before the write",
+                        len(suppressed_by_gate),
+                    )
 
                 # Build list of (fact_text, fact_id) for stored facts
                 stored_pairs: list[tuple[str, str | None]] = []
@@ -785,7 +804,7 @@ class SessionClient:
                             or str(fact)
                         )
                         fact_id = getattr(fact, "id", None)
-                    if fact_text:
+                    if fact_text and fact_text not in suppressed_by_gate:
                         stored_pairs.append((fact_text, fact_id))
 
                 # Apply pre_store_filter.

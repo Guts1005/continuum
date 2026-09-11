@@ -127,7 +127,13 @@ class Mem0Provider(BaseMemoryProvider):
             logger.debug(f"Initializing mem0 with config: {self._mem0_config}")
 
             # Initialize sync client - mem0's Memory.from_config() is synchronous
-            self._sync_memory = Memory.from_config(self._mem0_config)
+            # A Memory subclass with the pre_store_filter gate mixed in. Gating
+            # inside mem0 is what makes the filter a veto instead of a delete
+            # after the fact; see filtered_memory for why that distinction is not
+            # cosmetic.
+            from continuum.memory.providers.filtered_memory import build_filtered_memory_class
+
+            self._sync_memory = build_filtered_memory_class().from_config(self._mem0_config)
 
             self._initialized = True
             self._patch_milvus_strong_consistency()
@@ -259,6 +265,7 @@ class Mem0Provider(BaseMemoryProvider):
         metadata: dict[str, Any] | None = None,
         custom_prompt: str | None = None,
         infer: bool = True,
+        pre_store_filter: Any | None = None,
     ) -> MemoryAddResult:
         """
         Add memories using mem0's Memory.add() via asyncio.to_thread().
@@ -295,10 +302,27 @@ class Mem0Provider(BaseMemoryProvider):
                 f"mem0.add() with: user_id={user_id}, agent_id={agent_id}, conversation_id={conversation_id}"
             )
 
-            # Run sync memory.add() in thread pool
-            response = await asyncio.to_thread(self._sync_memory.add, **kwargs)
+            # Run sync memory.add() in thread pool.
+            #
+            # The filter is scoped onto the Memory instance rather than passed
+            # in: mem0 has no parameter for one, and the gate lives inside
+            # _create_memory several frames down -- past a ThreadPoolExecutor of
+            # mem0's own, which a ContextVar does not survive. The instance does
+            # cross that boundary; see filtered_memory for the measurement.
+            from continuum.memory.providers.filtered_memory import use_pre_store_filter
+
+            def _add_with_gate() -> tuple[Any, list[str]]:
+                with use_pre_store_filter(self._sync_memory, pre_store_filter) as sup:
+                    return self._sync_memory.add(**kwargs), list(sup)
+
+            response, suppressed = await asyncio.to_thread(_add_with_gate)
 
             result = MemoryAddResult.from_mem0_response(response)
+            result.suppressed = list(suppressed)
+            if suppressed:
+                logger.info(
+                    "🚫 pre_store_filter suppressed %d fact(s) before the write", len(suppressed)
+                )
             logger.debug(f"mem0.add() result: {result.message}, {len(result.results)} memories")
             return result
 
