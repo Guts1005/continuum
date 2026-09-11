@@ -319,8 +319,10 @@ def build_pre_store_filter() -> Callable[[list[str]], list[str]] | None:
         closed -- there is no rule to be safe about.
     pii -- drop any extracted fact containing an SSN.
     broken -- a filter that raises, to show the write path failing CLOSED:
-        every fact from that write is rejected and deleted, and it is reported
-        at ERROR rather than whispered at warning.
+        every fact from that write is suppressed before it is written, and it is
+        reported at ERROR rather than whispered at warning. Note it takes the
+        harmless preference with it: a filter that crashed has said nothing
+        about any of the facts, so none may stay.
     """
     mode = os.environ.get("CLINIC_FILTER", "off")
     if mode == "pii":
