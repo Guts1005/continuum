@@ -226,8 +226,8 @@ declares no data provenance, so the memory-poisoning defences are inactive…
 
 ## BM9 — the memory-write content filter (`CLINIC_FILTER`)
 
-A `pre_store_filter` inspects the facts mem0 extracted and returns the ones
-allowed to remain. `CLINIC_FILTER` selects one:
+A `pre_store_filter` is offered each fact mem0 extracted and returns the ones
+allowed to remain. A rejected fact is never written. `CLINIC_FILTER` selects one:
 
 | value | filter |
 |---|---|
@@ -237,26 +237,32 @@ allowed to remain. `CLINIC_FILTER` selects one:
 
 14. Restart `web.py` with `CLINIC_FILTER=pii` and send **"My SSN is
     123-45-6789, and I prefer morning appointments."** Two facts are extracted;
-    the filter rejects one:
+    one never reaches the store:
 
 ```
-INFO  🚫 pre_store_filter rejected 1 fact(s): ['dca06bcb-…']
-ERROR Rejected fact dca06bcb-… was not deleted (the provider reported failure)
-      — it REMAINS in long-term memory
-ERROR 1 fact(s) rejected by pre_store_filter are still stored: ['dca06bcb-…'].
-      … remove them out of band.
+INFO  🚫 pre_store_filter suppressed a fact before the write
+INFO  🚫 pre_store_filter suppressed 1 fact(s) before the write
+INFO  ✅ Memory: 1 fact(s) stored — Prefers morning appointments
 ```
+
+Refresh the panel: one row, `Prefers morning appointments`. No SSN row, no
+delete attempted, and no ERROR lines at all.
 
 15. Restart with `CLINIC_FILTER=broken` and send the same message. The filter
-    raises, so **both** facts are rejected — including the harmless preference:
+    raises, so **both** facts are suppressed — including the harmless preference:
 
 ```
 ERROR pre_store_filter raised (RuntimeError: PII scanner unavailable) —
-      rejecting all 2 fact(s) from this write, since nothing is known about
-      their contents
-INFO  🚫 pre_store_filter rejected 2 fact(s): ['f64aeac5-…', '35e24f32-…']
+      the fact was NOT written, since nothing is known about its contents
+ERROR pre_store_filter raised (RuntimeError: PII scanner unavailable) —
+      the fact was NOT written, since nothing is known about its contents
+INFO  🚫 pre_store_filter suppressed 2 fact(s) before the write
 ```
 
+The panel gains nothing. Measured: **0 rows stored.**
+
+- **What `pii` proves:** the filter is a gate. The row is never inserted, so
+  there is nothing to delete and no window in which the SSN is searchable.
 - **What `broken` proves:** the write path fails **closed**. A filter that
   cannot answer has said nothing about any of the facts, so none may stay.
   Rejecting everything loses benign memory; keeping everything loses the
@@ -264,22 +270,34 @@ INFO  🚫 pre_store_filter rejected 2 fact(s): ['f64aeac5-…', '35e24f32-…']
   everything, log a warning — so a crashed PII scanner meant the SSN was stored
   while the operator believed it was filtered.
 
-> **Read the ERROR lines: the filter does not prevent the write.** mem0 fuses
-> extraction and storage, so by the time these texts exist they are already in
-> the vector store; rejection is a *delete*, not a veto. Against Milvus that
-> delete races write-visibility and **loses often** — in the run above the SSN
-> fact was rejected and then *not deleted*, and it was still searchable minutes
-> later. Retrying the same id long after the write returned `True` and removed
-> it, so the row is not permanently undeletable; the immediate delete simply
-> lost the race.
+> **This used to be a delete, and it used to fail.** mem0 fuses extraction and
+> storage in one `add()` call, so the filter originally ran on rows that already
+> existed and rejection meant deleting them. Against Milvus that delete lost a
+> race it could not win: mem0's `delete()` reads the row back first (it needs the
+> old value for its history log) and Milvus hides recent writes behind `Bounded`
+> consistency. Measured live, twice, the output of this very step was:
 >
-> This is why a failed delete is now reported at ERROR naming the id
-> (`session/client.py` — `if ok is False:`). `Mem0Provider.delete` catches its
-> own exceptions and returns `False`, so watching only for a raise counted a
-> failed delete as a success and told `on_stored` the fact was removed. Treat
-> `pre_store_filter` as **damage control with an audit trail, not prevention**.
-> For content that must never be written, use `infer=False` so nothing is
-> extracted in the first place.
+> ```
+> ERROR Rejected fact dca06bcb-… was not deleted (the provider reported failure)
+>       — it REMAINS in long-term memory
+> ```
+>
+> and the SSN was still searchable minutes later. The failure was consistent
+> rather than random — the *first* delete after a write always lost and later
+> ones succeeded — so which fact survived depended on extraction order, not on
+> content.
+>
+> The gate now sits inside mem0's own `_create_memory`
+> (`memory/providers/filtered_memory.py`). The delete path remains as a fallback
+> for anything that reaches the store regardless, which is why those ERROR lines
+> still exist in the code even though this step no longer produces them.
+
+> **Two limits.** A memory provider that does not declare `pre_store_filter`
+> cannot gate, so the write falls back to delete-after-write with its race; the
+> degradation is logged once rather than passed over. And this filters *facts*,
+> not *inputs* — the SSN still reaches the model and the session transcript. For
+> content that must never get that far, sanitise the message with an input
+> scanner, or use `infer=False` so what you pass is exactly what is stored.
 
 ## BM10 — invisible codepoints do not survive a write
 

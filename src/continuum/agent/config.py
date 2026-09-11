@@ -56,22 +56,40 @@ class AgentMemoryConfig:
     # Memory policy hooks — product-level customization (domain-agnostic in SDK)
     # extraction_prompt: custom fact extraction prompt; if None, mem0 default is used
     extraction_prompt: str | None = None
-    # pre_store_filter: despite the name, this runs AFTER the write, not before
-    # it. mem0 fuses fact extraction and storage inside a single add() call and
-    # exposes no extract-without-store path (checked in 1.0.11 and 2.0.19), so
-    # the facts do not exist until they are already persisted. The filter is
-    # given the extracted texts and returns the subset to keep; the rest are
-    # deleted. Measured against a live Milvus, a rejected fact is searchable for
-    # roughly 280ms before the delete lands.
+    # pre_store_filter: given each fact mem0 extracted, returns the ones allowed
+    # to remain. A rejected fact is never written.
     #
-    # Treat it as damage control, not a gate. If a class of content must never
-    # touch the vector store at all, keep it out of the messages -- or disable
-    # extraction (infer=False), where what you pass is exactly what is stored and
-    # filtering the input really is filtering the row.
+    # It earns the name now, but it did not always. mem0 fuses extraction and
+    # storage inside a single add() call and exposes no extract-without-store
+    # path (checked in 1.0.11 and 2.0.19), so this used to run on rows that
+    # already existed and rejection meant deleting them. Against Milvus that
+    # delete lost a race it could not win -- mem0's delete() reads the row back
+    # first, Milvus hides recent writes behind Bounded consistency, and measured
+    # live the delete issued milliseconds after the write failed outright while
+    # the rejected fact stayed searchable for minutes.
     #
-    # It fails closed: a filter that raises rejects every fact from that write,
-    # and a fact that cannot be confirmed deleted stays in the list handed to
-    # on_stored rather than being reported as removed.
+    # The gate now sits inside mem0's own _create_memory (see
+    # memory/providers/filtered_memory.py), so nothing is inserted to undo.
+    #
+    # Facts are offered ONE AT A TIME -- the batch is not known until mem0 has
+    # finished extracting -- so a filter written as list[str] -> list[str] is
+    # called as filter([fact]). Membership decides: returning a *rewritten*
+    # string counts as a rejection, because a filter is a gate and not a
+    # transformer.
+    #
+    # It fails closed. A filter that raises has said nothing about the fact, so
+    # the fact is not written; a broken filter therefore rejects everything,
+    # including the harmless facts in the same turn. That is the trade, and the
+    # alternative -- keeping everything when the detector breaks -- loses the
+    # guarantee the filter was added to provide.
+    #
+    # Two limits worth knowing. A memory provider that does not declare
+    # pre_store_filter cannot gate, so the write falls back to
+    # delete-after-write with its race; that degradation is logged once rather
+    # than passed over in silence. And this filters facts, not inputs: for
+    # content that must never reach extraction at all, sanitise the message with
+    # an input scanner, or set infer=False so what you pass is exactly what is
+    # stored.
     pre_store_filter: MemoryPreStoreFilter | None = field(
         default=None, repr=False, compare=False, hash=False
     )

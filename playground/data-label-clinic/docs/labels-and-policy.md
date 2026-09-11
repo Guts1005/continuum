@@ -331,7 +331,7 @@ used by `refund-glassbox`) that builds a trace, forks from the post-
 | BM6    | the `on_labeled_recall` branch in `MemoryService` (fence / drop / `raise MemoryReviewRequiredError`) |
 | BM7    | `MemoryClient.mark_reviewed` (pops `PROVENANCE_LABELS_KEY`, writes `REVIEWED_KEY`) + `POST /memory/approve` in `web.py` |
 | BM8    | `MemoryService._warn_if_provenance_undeclared` — once per agent, not per turn |
-| BM9    | the `pre_store_filter` block in `SessionClient._store_in_memory`: fail-closed on a raising filter, then `if ok is False:` on each delete |
+| BM9    | `FilteredMemory._create_memory` gating on the active filter (`memory/providers/filtered_memory.py`), scoped by `Mem0Provider.add`; the delete-and-report block in `SessionClient._store_in_memory` remains as the fallback |
 | BM10   | `_strip_hidden_from_messages` + `strip_hidden_chars` (`_HIDDEN_CHARS_RE`) called in `MemoryClient.add` before the provider write |
 | C1     | `MCPServer._check_tool_digests` + `_cache_dirty` reset in `connect()` (drift after approval)                    |
 | C2     | `PolicyStore.default_deny` tool gate + `_clean_tool` hidden-char stripping + `format_tool_catalog` review output |
