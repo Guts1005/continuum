@@ -255,3 +255,38 @@ class TestTheClassHandedToMem0:
             mp.setattr(fm, "assert_mem0_seam_intact", lambda *a: called.append(a))
             fm.build_filtered_memory_class()
         assert called, "build_filtered_memory_class must verify the seam"
+
+
+class TestTheGateCannotBeBypassedByConstruction:
+    """Two changes the seam check cannot see, guarded here instead."""
+
+    def test_the_provider_uses_the_synchronous_memory(self):
+        """mem0's AsyncMemory has its own _create_memory that this mixin does
+        not cover. Continuum runs the sync class through asyncio.to_thread; a
+        switch to the async one would remove the gate with no error anywhere."""
+        import inspect
+
+        from continuum.memory.providers import mem0 as provider_mod
+
+        src = inspect.getsource(provider_mod)
+        assert "build_filtered_memory_class()" in src, (
+            "the provider no longer builds the gated class"
+        )
+        # Usage, not mention: the module docstring names AsyncMemory as an
+        # option, which is fine. Importing or constructing it is not.
+        for forbidden in ("import AsyncMemory", "AsyncMemory(", "AsyncMemory.from_config"):
+            assert forbidden not in src, (
+                f"the provider uses AsyncMemory ({forbidden}), whose _create_memory is "
+                f"not gated — extend FilteredMemory to cover it before switching"
+            )
+
+    def test_the_delete_fallback_is_still_wired(self):
+        """The fallback is what keeps a bypassed write from being silent, so it
+        is not dead code to be tidied away."""
+        import inspect
+
+        from continuum.session import client as session_client
+
+        src = inspect.getsource(session_client.SessionClient._store_in_memory)
+        assert "pre_store_filter(fact_texts)" in src, "the post-write filter fallback is gone"
+        assert "ok is False" in src, "the failed-delete report is gone"

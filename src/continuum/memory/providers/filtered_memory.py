@@ -19,10 +19,32 @@ both call it -- and Continuum uses mem0's synchronous ``Memory``, so one overrid
 covers every route. Suppressing there means the row is never inserted: nothing to
 delete, no race, no window.
 
-The price is a dependency on two private methods. ``assert_mem0_seam_intact``
-is the mitigation: an upstream rename must fail loudly at startup, because the
-alternative is a filter that silently stops filtering while every log line still
-says it is configured.
+The price is a dependency on two private methods, and mem0 is pinned only to
+``>=1.0.0,<2.0.0`` -- a fresh install can resolve to a minor version this was
+never run against.
+
+WHAT THE TRIPWIRE COVERS, AND WHAT IT DOES NOT
+
+``assert_mem0_seam_intact`` fails construction if ``_create_memory`` or
+``_update_memory`` is renamed or loses the argument the gate reads. That is the
+likely breakage and the one worth an exception, because the alternative is a
+filter that silently stops filtering while every log line still says it is
+configured.
+
+It cannot see two other changes:
+
+* **A write path that bypasses these methods.** If a future mem0 inserts rows
+  directly -- a batch write, a new branch in ``_add_to_vector_store`` -- the
+  check still passes while those facts are never offered to the filter. This is
+  why ``SessionClient`` keeps the old delete-and-report path: a fact that
+  reaches the store anyway is still rejected, still deleted, and still reported
+  at ERROR when the delete fails. Protection degrades to what it was before this
+  module existed, which is weaker but not silent.
+* **A switch to mem0's ``AsyncMemory``.** It has its own ``_create_memory``
+  (main.py, the async half of the file) which this mixin does not cover.
+  ``Mem0Provider`` builds the synchronous ``Memory`` and runs it through
+  ``asyncio.to_thread``; if that ever changes, the gate disappears with no
+  error. ``test_the_provider_uses_the_synchronous_memory`` is the guard.
 """
 
 from __future__ import annotations

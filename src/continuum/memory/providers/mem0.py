@@ -54,8 +54,9 @@ class Mem0Provider(BaseMemoryProvider):
     Memory provider using mem0.
 
     This provider leverages mem0's native functionality:
-    - AsyncMemory for non-blocking async operations
-    - Memory for synchronous operations
+    - Memory (the SYNCHRONOUS class) run through asyncio.to_thread. Not
+      AsyncMemory: the pre_store_filter gate is mixed into the sync class only,
+      so switching would silently remove it (see filtered_memory).
     - Native Qdrant metadata filtering
     - Custom fact extraction prompts
     - Custom memory update prompts
