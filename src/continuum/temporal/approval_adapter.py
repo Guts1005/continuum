@@ -77,6 +77,84 @@ def _heartbeat(message: str) -> None:
         pass
 
 
+def _activity_workflow_id() -> str | None:
+    """The workflow this activity belongs to, or None outside an activity."""
+    try:
+        from temporalio import activity
+
+        return str(activity.info().workflow_id)
+    except Exception:
+        return None
+
+
+def _temporal_client() -> Any:
+    from continuum.temporal.client import get_temporal_client
+
+    return get_temporal_client()
+
+
+def temporal_tool_approval(
+    *,
+    approvers: list[str] | None = None,
+    poll_interval: float = _DEFAULT_POLL_INTERVAL,
+) -> ToolApprovalHandler:
+    """A handler that finds its own workflow at call time.
+
+    An agent is built long before any workflow exists, so it cannot be handed a
+    handle at construction. This resolves one per call: the id from
+    ``activity.info()``, the handle from the global Temporal client.
+
+    Outside an activity -- a local script, a test, an HTTP server -- it DEFERS.
+    Not approves: the action would then proceed unreviewed by the very
+    configuration that asked for review. Not denies either: nobody refused it,
+    and deferring says truthfully that it did not happen and can be asked again.
+    """
+
+    async def handler(request: ToolApprovalRequest) -> ToolApprovalDecision:
+        from continuum.agent.approval import ToolApprovalDecision
+
+        workflow_id = _activity_workflow_id()
+        if workflow_id is None:
+            logger.error(
+                "temporal_tool_approval is configured but this run is not inside a "
+                "Temporal activity, so no workflow can be asked — deferring '%s'",
+                request.tool_name,
+            )
+            return ToolApprovalDecision(
+                approved=False,
+                deferred=True,
+                reason=(
+                    "This run is not inside a Temporal activity, so no reviewer could "
+                    "be reached. Use an in-process approval handler here."
+                ),
+            )
+
+        try:
+            handle = await _temporal_client().get_workflow_handle(workflow_id)
+        except Exception as e:
+            logger.error(
+                "Could not reach the Temporal workflow %s (%s: %s) — deferring",
+                workflow_id,
+                type(e).__name__,
+                e,
+            )
+            return ToolApprovalDecision(
+                approved=False,
+                deferred=True,
+                reason=(
+                    f"The approval workflow could not be reached ({e}). If this says "
+                    "'Not connected', the GLOBAL Temporal client needs connecting — a "
+                    "worker's own client is a different one: "
+                    "await get_temporal_client().connect(host)."
+                ),
+            )
+
+        inner = temporal_approval_handler(handle, approvers=approvers, poll_interval=poll_interval)
+        return await inner(request)
+
+    return handler
+
+
 def temporal_approval_handler(
     workflow_handle: Any,
     *,

@@ -203,3 +203,81 @@ class TestOutsideAnActivity:
 
         with pytest.raises(ValueError, match="workflow handle"):
             temporal_approval_handler(None)  # type: ignore[arg-type]
+
+
+class TestTheSelfResolvingHandler:
+    """An agent is built long before any workflow exists, so a handler cannot be
+    handed a workflow handle at construction time. This one finds its own at
+    call time: the id from ``activity.info()``, the handle from the global
+    client."""
+
+    async def test_it_finds_the_workflow_it_is_running_under(self, monkeypatch):
+        from continuum.temporal import approval_adapter as mod
+
+        handle = MagicMock()
+        handle.signal = AsyncMock()
+        handle.query = AsyncMock(return_value={"status": "approved", "decided_by": "alice"})
+
+        client = MagicMock()
+        client.get_workflow_handle = AsyncMock(return_value=handle)
+        monkeypatch.setattr(mod, "_activity_workflow_id", lambda: "wf-42")
+        monkeypatch.setattr(mod, "_temporal_client", lambda: client)
+
+        decision = await mod.temporal_tool_approval(poll_interval=0.01)(_request())
+
+        assert decision.approved
+        client.get_workflow_handle.assert_awaited_once_with("wf-42")
+
+    async def test_outside_an_activity_it_defers_rather_than_approving(self, monkeypatch):
+        """Configured for Temporal but running outside one -- a local script, a
+        test, an HTTP server. The action must not proceed unreviewed, and it was
+        not refused by anyone either."""
+        from continuum.temporal import approval_adapter as mod
+
+        monkeypatch.setattr(mod, "_activity_workflow_id", lambda: None)
+
+        decision = await mod.temporal_tool_approval(poll_interval=0.01)(_request())
+        assert not decision.approved
+        assert decision.deferred
+        assert "activity" in (decision.reason or "").lower()
+
+    async def test_an_unreachable_client_defers(self, monkeypatch):
+        from continuum.temporal import approval_adapter as mod
+
+        monkeypatch.setattr(mod, "_activity_workflow_id", lambda: "wf-42")
+
+        def boom():
+            raise ConnectionError("no temporal client")
+
+        monkeypatch.setattr(mod, "_temporal_client", boom)
+
+        decision = await mod.temporal_tool_approval(poll_interval=0.01)(_request())
+        assert decision.deferred
+
+
+class TestTheGlobalClientMustBeConnected:
+    """Found live: the handler resolves its handle through the GLOBAL client,
+    which is not the worker's own. A worker connects its client to run
+    activities; that does nothing for this one, so an otherwise correct setup
+    defers every approval with 'Not connected to Temporal server'.
+
+    It fails safe, which is why the live run produced a deferral rather than an
+    unreviewed call. But an operator seeing every approval defer needs the
+    message to name the cause rather than read as a network problem.
+    """
+
+    async def test_an_unconnected_global_client_says_what_to_do(self, monkeypatch):
+        from continuum.temporal import approval_adapter as mod
+        from continuum.temporal.exceptions import TemporalConnectionError
+
+        class Unconnected:
+            async def get_workflow_handle(self, _id):
+                raise TemporalConnectionError("Not connected to Temporal server")
+
+        monkeypatch.setattr(mod, "_activity_workflow_id", lambda: "wf-1")
+        monkeypatch.setattr(mod, "_temporal_client", Unconnected)
+
+        decision = await mod.temporal_tool_approval(poll_interval=0.01)(_request())
+        assert decision.deferred
+        reason = (decision.reason or "").lower()
+        assert "connect" in reason, "the message must name the cause, not just the symptom"
