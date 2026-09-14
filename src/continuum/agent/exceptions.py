@@ -316,6 +316,40 @@ class ToolAccessDeniedError(AgentToolError, PolicyDeniedError):
             self.context["denial_message"] = denial_message
 
 
+class ToolApprovalDeniedError(AgentToolError, PolicyDeniedError):
+    """Raised when a person declined a tool call, or nobody answered in time.
+
+    A PolicyDeniedError like its neighbour above, so the existing handling
+    treats it as a governance outcome rather than a fault: logged at INFO
+    without a traceback, and turned into a tool result the model can relay.
+    A refusal is the gate working.
+
+    Distinct from ToolAccessDeniedError because the two answer different
+    questions. Policy asks *may this run use this tool* and decides by rule;
+    this asks *should this particular call, with these arguments, happen* and
+    the answer came from a human. Collapsing them would lose that in the audit
+    trail, where it is the part that matters.
+    """
+
+    def __init__(
+        self,
+        tool_name: str,
+        reviewer: str | None = None,
+        reason: str | None = None,
+        **kwargs: Any,
+    ):
+        message = f"Approval denied: tool '{tool_name}' was not approved"
+        if reviewer:
+            message += f" by {reviewer}"
+        if reason:
+            message += f" ({reason})"
+        super().__init__(message, tool_name=tool_name, **kwargs)
+        if reviewer:
+            self.context["reviewer"] = reviewer
+        if reason:
+            self.context["reason"] = reason
+
+
 class MemoryAccessDeniedError(AgentError, PolicyDeniedError):
     """Raised when an access policy denies a memory read or write. Expected
     governance outcome (see :class:`PolicyDeniedError`), not a failure."""
