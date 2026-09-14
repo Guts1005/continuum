@@ -395,7 +395,7 @@ def approval_timeout() -> float:
 
 def build_approval_tools() -> set[str]:
     """Which tools need a person. Empty unless CLINIC_APPROVAL asks for one."""
-    if os.environ.get("CLINIC_APPROVAL", "off") in ("auto", "deny", "ask"):
+    if os.environ.get("CLINIC_APPROVAL", "off") in ("auto", "deny", "ask", "queue"):
         return {APPROVAL_TOOL}
     return set()
 
@@ -409,9 +409,13 @@ def build_approval_handler():
         path without a browser.
     deny -- refuse programmatically. Shows what the model is told when a person
         says no, without waiting for one.
-    ask -- a real prompt in the web UI. The handler lives in web.py because it
-        has to reach a browser; this returns it lazily so importing config does
-        not drag in FastAPI.
+    ask -- a real prompt in the web UI, blocking the turn while a reviewer
+        answers. Needs the reviewer to be watching, because the HTTP request
+        stays open the whole time.
+    queue -- refuse and resume. The first ask is DEFERRED: the turn ends at once
+        telling the user it is pending, somebody answers out of band, and the
+        next turn asking the same thing proceeds. The shape for a reviewer who
+        is not sitting there, and the one that does not hold a connection open.
     """
     mode = os.environ.get("CLINIC_APPROVAL", "off")
     if mode == "auto":
@@ -422,6 +426,10 @@ def build_approval_handler():
         from approval_ui import ui_approval_handler
 
         return ui_approval_handler
+    if mode == "queue":
+        from approval_ui import queue_approval_handler
+
+        return queue_approval_handler
     return None
 
 

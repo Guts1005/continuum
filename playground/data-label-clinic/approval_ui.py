@@ -73,6 +73,80 @@ def pending_approvals() -> list[dict[str, Any]]:
     ]
 
 
+# ── refuse-and-resume: the queue ────────────────────────────────────────────
+#
+# `ask` blocks the turn while a reviewer answers, which needs the HTTP request
+# to stay open and so needs the reviewer to be watching. `queue` is the other
+# shape: the call is parked, the turn ends NOW telling the user it is pending,
+# somebody answers whenever they get to it, and the user asks again.
+#
+# Keyed by (tool, arguments) rather than by request id, because the second turn
+# is a different run asking the same question -- there is no id to carry over.
+# The SDK deliberately remembers nothing between runs (a cached approval could
+# authorise an execution nobody saw), so an app that wants resumption supplies
+# the memory and decides its own rules. This is the smallest such store.
+
+_QUEUE: dict[str, dict[str, Any]] = {}
+
+
+def _queue_key(tool_name: str, arguments: dict[str, Any]) -> str:
+    import json
+
+    return f"{tool_name}::{json.dumps(arguments, sort_keys=True)}"
+
+
+async def queue_approval_handler(request: ToolApprovalRequest) -> ToolApprovalDecision:
+    """Defer on the first ask; honour the answer on a later one.
+
+    Returns immediately either way, so the turn never holds a request open.
+    """
+    from continuum.agent.approval import ToolApprovalDecision
+
+    key = _queue_key(request.tool_name, request.arguments)
+    entry = _QUEUE.get(key)
+
+    if entry is not None and entry.get("decided") is not None:
+        approved = bool(entry["decided"])
+        _QUEUE.pop(key, None)  # one answer authorises one execution, not a standing permit
+        return ToolApprovalDecision(
+            approved=approved,
+            reviewer=entry.get("reviewer"),
+            reason=None if approved else "A reviewer declined this action.",
+        )
+
+    _QUEUE.setdefault(
+        key,
+        {
+            "tool_name": request.tool_name,
+            "arguments": request.arguments,
+            "data_labels": sorted(request.data_labels),
+            "decided": None,
+            "reviewer": None,
+        },
+    )
+    return ToolApprovalDecision(
+        approved=False,
+        deferred=True,
+        reason="Queued for a reviewer. Ask again once it has been answered.",
+    )
+
+
+def queued_approvals() -> list[dict[str, Any]]:
+    return [
+        {"key": k, **{x: v[x] for x in ("tool_name", "arguments", "data_labels", "decided")}}
+        for k, v in _QUEUE.items()
+    ]
+
+
+def answer_queued(key: str, approved: bool, reviewer: str = "ui") -> bool:
+    entry = _QUEUE.get(key)
+    if entry is None:
+        return False
+    entry["decided"] = approved
+    entry["reviewer"] = reviewer
+    return True
+
+
 def submit_decision(request_id: str, approved: bool, reviewer: str = "ui") -> bool:
     """Resolve a waiting handler. False when there is nothing to resolve --
     already answered, or already timed out and cleaned up."""

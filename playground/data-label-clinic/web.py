@@ -91,6 +91,12 @@ class MemWriteRequest(BaseModel):
     user_id: str = "u1"
 
 
+class ApprovalAnswerRequest(BaseModel):
+    key: str
+    approved: bool
+    reviewer: str = "ui"
+
+
 class ApprovalDecideRequest(BaseModel):
     request_id: str
     approved: bool
@@ -338,6 +344,26 @@ async def approval_pending():
     from approval_ui import pending_approvals
 
     return {"pending": pending_approvals()}
+
+
+@app.get("/approval/queued")
+async def approval_queued():
+    """Calls parked by `queue` mode, waiting for someone to answer (F7).
+
+    Unlike /approval/pending these are not holding a turn open -- the turn
+    already ended and told the user it is pending.
+    """
+    from approval_ui import queued_approvals
+
+    return {"queued": queued_approvals()}
+
+
+@app.post("/approval/answer")
+async def approval_answer(req: ApprovalAnswerRequest):
+    """Answer a queued call. The next turn asking the same thing acts on it."""
+    from approval_ui import answer_queued
+
+    return {"ok": answer_queued(req.key, req.approved, reviewer=req.reviewer)}
 
 
 @app.post("/approval/decide")

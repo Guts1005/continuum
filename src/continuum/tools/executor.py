@@ -788,6 +788,7 @@ class ToolExecutor:
                     tool_name=tool_name,
                     reviewer=decision.reviewer,
                     reason=decision.reason,
+                    deferred=decision.deferred,
                 )
             logger.info(
                 "Tool '%s' approved%s",
@@ -1003,15 +1004,29 @@ class ToolExecutor:
             if isinstance(result, BaseException):
                 tc = tool_calls[i]
                 if isinstance(result, ToolApprovalDeniedError):
-                    # A person said no, or nobody answered. Expected.
+                    # A person said no, nobody answered, or it was handed to
+                    # someone who will answer later. All expected.
                     logger.info(f"Tool '{tc.function.name}' was not approved: {result}")
                     reason = result.context.get("reason", "")
                     reviewer = result.context.get("reviewer", "")
-                    content = f"APPROVAL DENIED: '{tc.function.name}' was not approved"
-                    if reviewer:
-                        content += f" by {reviewer}"
-                    content += f". {reason}" if reason else "."
-                    content += " Inform the user this action needs approval and was not performed."
+                    if result.context.get("deferred"):
+                        # PENDING, not DENIED. A user told their request was
+                        # refused does not go looking for an approver, and this
+                        # one is waiting on exactly that.
+                        content = f"APPROVAL PENDING: '{tc.function.name}' has been sent for approval"
+                        content += f". {reason}" if reason else "."
+                        content += (
+                            " It has NOT been performed. Tell the user it is awaiting approval "
+                            "and that they should ask again once it has been reviewed."
+                        )
+                    else:
+                        content = f"APPROVAL DENIED: '{tc.function.name}' was not approved"
+                        if reviewer:
+                            content += f" by {reviewer}"
+                        content += f". {reason}" if reason else "."
+                        content += (
+                            " Inform the user this action needs approval and was not performed."
+                        )
                 elif isinstance(result, ToolAccessDeniedError):
                     # Policy denial is expected — log at INFO without traceback
                     logger.info(f"Tool '{tc.function.name}' denied by policy: {result}")

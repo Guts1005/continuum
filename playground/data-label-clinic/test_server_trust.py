@@ -1151,3 +1151,122 @@ class TestTheAgentDeclaresApproval:
 
         src = inspect.getsource(clinic_agent)
         assert "APPROVAL DENIED" in src, "approval denials are not surfaced as gate events"
+
+
+class TestQueueMode:
+    """`queue` is refuse-and-resume: the turn ends at once saying pending, a
+    reviewer answers out of band, and a later turn asking the same thing
+    proceeds. The shape for a reviewer who is not watching a screen, and the one
+    that does not hold an HTTP request open."""
+
+    def _cfg(self, monkeypatch):
+        import importlib
+
+        import config as clinic_config
+
+        monkeypatch.setenv("CLINIC_APPROVAL", "queue")
+        importlib.reload(clinic_config)
+        return clinic_config
+
+    def test_queue_declares_the_gated_tool(self, monkeypatch):
+        cfg = self._cfg(monkeypatch)
+        assert cfg.APPROVAL_TOOL in cfg.build_approval_tools()
+
+    async def test_the_first_ask_defers_rather_than_refusing(self, monkeypatch):
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._cfg(monkeypatch)
+        d = await cfg.build_approval_handler()(
+            ToolApprovalRequest(
+                tool_name=cfg.APPROVAL_TOOL,
+                arguments={"medications": ["a", "b"]},
+                agent_name="clinic",
+            )
+        )
+        assert d.deferred, "a queued call must be pending, not refused"
+        assert not d.approved
+
+    async def test_a_later_ask_acts_on_the_answer(self, monkeypatch):
+        """The resume half. Keyed on (tool, arguments) because the second turn
+        is a different run asking the same question -- there is no request id to
+        carry over, and the SDK deliberately remembers nothing between runs."""
+        from approval_ui import answer_queued, queued_approvals
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._cfg(monkeypatch)
+        handler = cfg.build_approval_handler()
+        req = ToolApprovalRequest(
+            tool_name=cfg.APPROVAL_TOOL,
+            arguments={"medications": ["metformin", "lisinopril"]},
+            agent_name="clinic",
+        )
+        assert (await handler(req)).deferred
+
+        # Matched on the arguments, not just the tool: the queue is a module
+        # global that outlives a test, so "the first entry for this tool" can be
+        # another test's. Real deployments hit the same thing -- the store is
+        # shared across every run, which is why the key includes the arguments.
+        want = {"medications": ["metformin", "lisinopril"]}
+        queued = [q for q in queued_approvals() if q["arguments"] == want]
+        assert queued, "the call was not parked for a reviewer"
+        assert answer_queued(queued[0]["key"], approved=True, reviewer="tom")
+
+        second = await handler(req)
+        assert second.approved
+        assert second.reviewer == "tom"
+
+    async def test_an_answer_authorises_one_execution_not_a_standing_permit(self, monkeypatch):
+        """Otherwise one approval silently covers every future call with the
+        same arguments -- which is the cached-approval hazard the SDK refuses to
+        build in."""
+        from approval_ui import answer_queued, queued_approvals
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._cfg(monkeypatch)
+        handler = cfg.build_approval_handler()
+        req = ToolApprovalRequest(
+            tool_name=cfg.APPROVAL_TOOL, arguments={"medications": ["x"]}, agent_name="clinic"
+        )
+        await handler(req)
+        key = [q for q in queued_approvals() if q["arguments"] == {"medications": ["x"]}][0]["key"]
+        answer_queued(key, approved=True)
+        assert (await handler(req)).approved
+
+        # asking a third time starts over
+        assert (await handler(req)).deferred
+
+    async def test_a_refusal_from_the_queue_is_a_refusal_not_a_deferral(self, monkeypatch):
+        from approval_ui import answer_queued, queued_approvals
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._cfg(monkeypatch)
+        handler = cfg.build_approval_handler()
+        req = ToolApprovalRequest(
+            tool_name=cfg.APPROVAL_TOOL, arguments={"medications": ["y"]}, agent_name="clinic"
+        )
+        await handler(req)
+        key = [q for q in queued_approvals() if q["arguments"] == {"medications": ["y"]}][0]["key"]
+        answer_queued(key, approved=False, reviewer="bob")
+
+        d = await handler(req)
+        assert not d.approved
+        assert not d.deferred, "a declined queued call is refused, not still pending"
+
+    def test_answering_an_unknown_key_is_reported_not_raised(self, monkeypatch):
+        from approval_ui import answer_queued
+
+        self._cfg(monkeypatch)
+        assert not answer_queued("no-such-key", approved=True)
+
+    def test_a_deferral_reaches_the_glassbox(self):
+        """⏳ rather than ⏸: 'nobody has answered yet' is resumable and 'a person
+        said no' is not, which is the whole difference the state exists for."""
+        import inspect
+
+        import agent as clinic_agent
+
+        src = inspect.getsource(clinic_agent)
+        assert "APPROVAL PENDING" in src

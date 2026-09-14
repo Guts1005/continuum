@@ -317,3 +317,74 @@ class TestAgentConfig:
         from continuum.agent.config import AgentConfig
 
         assert 0 < AgentConfig().approval_timeout <= 60
+
+
+class TestDeferral:
+    """A deferred call is not a refused one, and the difference has to be
+    representable or the model tells the user the wrong thing.
+
+    Without this, a handler that parks a request for a human to answer later has
+    only ``approved=False`` to return, so the model is told APPROVAL DENIED and
+    reports a refusal for an action that is merely waiting. That is the whole of
+    the refuse-and-resume pattern: the turn ends, someone answers out of band,
+    the user asks again.
+    """
+
+    async def test_a_decision_can_say_deferred(self):
+        from continuum.agent.approval import ToolApprovalDecision
+
+        d = ToolApprovalDecision(approved=False, deferred=True, reason="queued for review")
+        assert d.deferred
+        assert not d.approved
+
+    async def test_deferred_defaults_off_so_a_refusal_stays_a_refusal(self):
+        from continuum.agent.approval import ToolApprovalDecision
+
+        assert not ToolApprovalDecision(approved=False).deferred
+        assert not ToolApprovalDecision(approved=True).deferred
+
+    async def test_an_approved_decision_cannot_also_be_deferred(self):
+        """Approved-and-deferred has no meaning: either the call proceeds now or
+        it does not. Allowing both would leave the executor guessing."""
+        from continuum.agent.approval import ToolApprovalDecision
+
+        with pytest.raises(ValueError, match="deferred"):
+            ToolApprovalDecision(approved=True, deferred=True)
+
+    async def test_a_deferring_handler_round_trips(self):
+        from continuum.agent.approval import ToolApprovalDecision, request_approval
+
+        parked: list = []
+
+        async def defer(req):
+            parked.append(req)
+            return ToolApprovalDecision(
+                approved=False, deferred=True, reason="sent to the on-call clinician"
+            )
+
+        decision = await request_approval(_request(), defer, timeout=5)
+        assert decision.deferred
+        assert len(parked) == 1
+
+    async def test_a_timeout_is_a_refusal_not_a_deferral(self):
+        """Nobody answered inside the window, so the action did not happen and
+        is not queued. Reporting it as pending would promise a resumption that
+        nothing is going to deliver."""
+        from continuum.agent.approval import request_approval
+
+        async def never(_req):
+            await asyncio.sleep(10)
+
+        decision = await request_approval(_request(), never, timeout=0.05)
+        assert not decision.approved
+        assert not decision.deferred
+
+    async def test_a_raising_handler_is_a_refusal_not_a_deferral(self):
+        from continuum.agent.approval import request_approval
+
+        async def broken(_req):
+            raise RuntimeError("queue unreachable")
+
+        decision = await request_approval(_request(), broken, timeout=5)
+        assert not decision.approved
+        assert not decision.deferred

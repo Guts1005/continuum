@@ -236,3 +236,59 @@ class TestTheTimeoutBoundary:
         assert invoked.await_count == 1, (
             "the approval wait was charged against the tool execution timeout"
         )
+
+
+class TestDeferralAtTheGate:
+    """A deferred call must reach the model as pending, not as refused."""
+
+    async def test_a_deferred_call_does_not_run(self, monkeypatch):
+        from continuum.agent.approval import ToolApprovalDecision
+        from continuum.agent.exceptions import ToolApprovalDeniedError
+
+        async def defer(_req):
+            return ToolApprovalDecision(
+                approved=False, deferred=True, reason="sent to the on-call clinician"
+            )
+
+        ex = _executor()
+        settings = _settings({"send_referral_email"}, defer)
+        invoked = AsyncMock(return_value=("sent", None))
+        monkeypatch.setattr(
+            "continuum.tools.util.MCPUtil.invoke_mcp_tool_with_artifact", invoked
+        )
+
+        with pytest.raises(ToolApprovalDeniedError) as exc:
+            await ex.execute_tool_call(_call(), approval=settings)
+
+        assert invoked.await_count == 0
+        assert exc.value.context.get("deferred") is True
+
+    async def test_the_model_is_told_pending_not_denied(self):
+        """The one thing deferral has to communicate. 'DENIED' would have the
+        model report a refusal for an action that is merely waiting, and a user
+        told their request was refused does not go looking for an approver."""
+        from continuum.agent.exceptions import ToolApprovalDeniedError
+        from continuum.tools.executor import ToolExecutor
+
+        ex = ToolExecutor.__new__(ToolExecutor)
+        err = ToolApprovalDeniedError(
+            tool_name="send_referral_email",
+            reason="sent to the on-call clinician",
+            deferred=True,
+        )
+        messages = ex._process_tool_results([err], [_call()])
+
+        content = messages[0].content
+        assert "APPROVAL PENDING" in content
+        assert "APPROVAL DENIED" not in content
+        assert "sent to the on-call clinician" in content
+
+    async def test_a_plain_refusal_still_says_denied(self):
+        from continuum.agent.exceptions import ToolApprovalDeniedError
+        from continuum.tools.executor import ToolExecutor
+
+        ex = ToolExecutor.__new__(ToolExecutor)
+        err = ToolApprovalDeniedError(tool_name="t", reviewer="bob", reason="no")
+        content = ex._process_tool_results([err], [_call("t")])[0].content
+        assert "APPROVAL DENIED" in content
+        assert "PENDING" not in content

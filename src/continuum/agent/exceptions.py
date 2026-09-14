@@ -336,9 +336,11 @@ class ToolApprovalDeniedError(AgentToolError, PolicyDeniedError):
         tool_name: str,
         reviewer: str | None = None,
         reason: str | None = None,
+        deferred: bool = False,
         **kwargs: Any,
     ):
-        message = f"Approval denied: tool '{tool_name}' was not approved"
+        verb = "is awaiting approval" if deferred else "was not approved"
+        message = f"Approval denied: tool '{tool_name}' {verb}"
         if reviewer:
             message += f" by {reviewer}"
         if reason:
@@ -348,6 +350,11 @@ class ToolApprovalDeniedError(AgentToolError, PolicyDeniedError):
             self.context["reviewer"] = reviewer
         if reason:
             self.context["reason"] = reason
+        if deferred:
+            # Read by the executor to say PENDING rather than DENIED. Kept on
+            # the same exception because the control flow is identical -- the
+            # call does not run either way -- and only the wording differs.
+            self.context["deferred"] = True
 
 
 class MemoryAccessDeniedError(AgentError, PolicyDeniedError):

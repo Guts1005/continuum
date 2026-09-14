@@ -75,7 +75,7 @@ one in the repo-root `.env` also works, but note `config.py` loads it with
 |---|---|---|
 | `CLINIC_RECALL` | `fence` (default) · `drop` · `block` | what a labelled recalled row does ([F6](F6-memory.md)) |
 | `CLINIC_FILTER` | `off` (default) · `pii` · `broken` | the memory-write content filter ([F6](F6-memory.md)) |
-| `CLINIC_APPROVAL` | `off` (default) · `auto` · `deny` · `ask` | who answers a tool-approval prompt ([F7](F7-approval.md)) |
+| `CLINIC_APPROVAL` | `off` (default) · `auto` · `deny` · `ask` · `queue` | who answers a tool-approval prompt ([F7](F7-approval.md)) |
 | `CLINIC_APPROVAL_TIMEOUT` | seconds, default `30` | how long the gate waits for a person ([F7](F7-approval.md)) |
 | `CLINIC_POISON` | `1` | serve hostile tool *descriptions* ([F3](F3-server-trust.md)) |
 | `WEB_POISON` | `1` | `web_lookup` returns a planted instruction ([F6](F6-memory.md)) |

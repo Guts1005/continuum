@@ -59,7 +59,8 @@ detector) and `pre_store_filter` (no content classifier).
 | `off` (default) | none, and no tool is declared either — the gate is inert. The state a new project starts in |
 | `auto` | approves programmatically. For scripted runs that need the approved path without a browser |
 | `deny` | refuses programmatically. Shows what the model is told, without waiting for a person |
-| `ask` | a real prompt in the web UI. The mode that actually blocks on a human |
+| `ask` | a real prompt in the web UI, blocking the turn while a reviewer answers |
+| `queue` | refuse and resume — the turn ends at once saying *pending*, someone answers out of band, a later turn proceeds |
 
 `CLINIC_APPROVAL_TIMEOUT` (default 30) is how long the gate waits. It is
 switchable because the limit **is** the demo — see AP4.
@@ -182,14 +183,64 @@ sitting there claiming to be live.
   `CLINIC_APPROVAL_TIMEOUT=3` and walk away to see what a reviewer who takes two
   minutes behind a proxy will actually experience.
 
+## AP5 — refuse and resume, for a reviewer who is not watching
+
+`ask` holds the HTTP request open while someone decides, which only works if
+they are looking at the screen. `queue` is the other shape, and the one most
+asynchronous deployments actually need.
+
+7. Restart with `CLINIC_APPROVAL=queue` and send **"Check for interactions
+   between metformin and lisinopril."** The turn ends immediately:
+
+```
+gate:  ⏳ TOOL — awaiting approval: APPROVAL PENDING:
+       'pharmacy__check_interactions' has been sent for approval. Queued for a
+       reviewer. Ask again once it has been answered.
+reply: The request to check interactions between metformin and lisinopril is
+       awaiting approval. Please ask again once it has been reviewed.
+```
+
+8. Answer it out of band — no turn is waiting on this:
+
+```bash
+curl -s localhost:8910/approval/queued
+curl -sX POST localhost:8910/approval/answer -H 'Content-Type: application/json' \
+     -d '{"key":"<key from above>","approved":true,"reviewer":"tom"}'
+```
+
+9. Ask the same question again. It proceeds:
+
+```
+tools: ['pharmacy__check_interactions']
+reply: There are no clinically significant interactions between metformin and
+       lisinopril. They are commonly co-prescribed.
+```
+
+- **What it proves:** a third outcome exists. Without it a deferred call and a
+  refused one are the same value (`approved=False`), so the model says APPROVAL
+  DENIED for something that is merely waiting — and a user told their request
+  was *refused* does not go looking for an approver. The panel separates them
+  too: **⏳** for pending, **⏸** for declined. One is resumable and the other is
+  not, which is the whole reason the state exists.
+- **Only a handler may defer.** A timeout or a crash is a refusal, never a
+  deferral: nobody answered and nothing is queued, so reporting it as pending
+  would promise a resumption that nothing is going to deliver.
+- **The resume half is the application's.** The SDK remembers nothing between
+  runs — a cached approval could authorise an execution the reviewer never saw —
+  so `approval_ui.py` supplies the store and its rules. It keys on
+  *(tool, arguments)*, because the second turn is a different run asking the
+  same question and there is no request id to carry over. An answer authorises
+  **one** execution and is then forgotten; asking a third time queues again. A
+  standing permit would be exactly the hazard the SDK declines to build in.
+
 ---
 
 ## What this layer does and doesn't cover
 
 - **Covers:** the gate firing on a declared tool, an approval proceeding, a
-  refusal relayed as a tool result, a real prompt carrying the arguments, and
-  failing closed on a timeout — live, with the ungated `off` mode as the control
-  for each.
+  refusal relayed as a tool result, a real prompt carrying the arguments,
+  failing closed on a timeout, and the refuse-and-resume round trip — live, with
+  the ungated `off` mode as the control for each.
 
 - **Doesn't cover: a durable, hours-long wait.** This is the honest limit, and
   it is structural rather than missing glue. `HumanInLoopManager` is the
@@ -228,4 +279,5 @@ sitting there claiming to be live.
 | AP2 | `ToolApprovalDeniedError` (a `PolicyDeniedError`) rendered by `ToolExecutor._process_tool_results` as `APPROVAL DENIED` |
 | AP3 | `ToolApprovalRequest` carrying `arguments` and `data_labels`; `request_approval` serialising on a per-event-loop lock |
 | AP4 | `request_approval`'s fail-closed paths — timeout, raise, wrong return type, and no handler wired |
+| AP5 | `ToolApprovalDecision(deferred=True)` → `APPROVAL PENDING` rather than `APPROVAL DENIED`; the resume store is the app's (`approval_ui.py`) |
 | all | `build_approval_settings` reading `AgentConfig`, passed at both `ToolService` call sites |

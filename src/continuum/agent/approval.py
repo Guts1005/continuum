@@ -94,9 +94,32 @@ class ToolApprovalRequest:
 
 @dataclass(frozen=True)
 class ToolApprovalDecision:
+    """approved, refused, or deferred -- three outcomes, not two.
+
+    ``deferred`` marks a call that was neither allowed nor refused: it was
+    handed to someone who will answer later, the turn ends now, and the user is
+    expected to ask again once it is answered. That is the refuse-and-resume
+    pattern, and it needs to be distinguishable from a refusal or the model
+    tells the user their request was DENIED when it is merely waiting -- and a
+    user told they were refused does not go looking for an approver.
+
+    Only a handler may defer. A timeout or a crash is a refusal: nobody answered
+    and nothing is queued, so promising a resumption would be promising
+    something nothing is going to deliver.
+    """
+
     approved: bool
     reviewer: str | None = None
     reason: str | None = None
+    deferred: bool = False
+
+    def __post_init__(self) -> None:
+        if self.approved and self.deferred:
+            raise ValueError(
+                "a decision cannot be both approved and deferred: either the call "
+                "proceeds now or it does not, and allowing both would leave the "
+                "executor guessing which was meant"
+            )
 
 
 ToolApprovalHandler = Callable[[ToolApprovalRequest], Awaitable[ToolApprovalDecision]]

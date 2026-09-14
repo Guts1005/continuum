@@ -439,6 +439,12 @@ class ClinicAgent:
             if role == "tool":
                 if "POLICY DENIED" in content:
                     gate_events.append(f"🛡️ TOOL — blocked: {content.strip()[:200]}")
+                elif "APPROVAL PENDING" in content:
+                    # Deferred, not refused. Shown with ⏳ rather than ⏸ so the
+                    # panel distinguishes "a person said no" from "nobody has
+                    # answered yet" -- the second is resumable and the first is
+                    # not, which is the whole difference the state exists for.
+                    gate_events.append(f"⏳ TOOL — awaiting approval: {content.strip()[:200]}")
                 elif "APPROVAL DENIED" in content:
                     # A person said no, or nobody answered inside the timeout.
                     # Surfaced separately from a policy denial because the panel
