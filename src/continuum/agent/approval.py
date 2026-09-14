@@ -146,6 +146,36 @@ def _ask_lock() -> asyncio.Lock:
     return lock
 
 
+def build_approval_settings(agent: Any) -> ToolApprovalSettings | None:
+    """Read an agent's approval configuration into what the executor needs.
+
+    Returns ``None`` when the agent declares no tools, so an app that never
+    enabled this pays nothing per call.
+
+    Deliberately returns settings when tools ARE declared but no handler is
+    wired. That configuration must reach the gate precisely because it is
+    broken: the gate refuses and says so. Returning ``None`` here would turn
+    "declared but unwired" into "silently ungated", which is the failure this
+    whole finding is about.
+    """
+    config = getattr(agent, "config", None)
+    if config is None:
+        return None
+    declared = getattr(config, "tool_approval", None) or set()
+    if not declared:
+        return None
+
+    handler = getattr(config, "approval_handler", None)
+    agent_name = getattr(agent, "name", "")
+    warn_if_approval_unwired(agent_name, set(declared), handler)
+    return ToolApprovalSettings(
+        tools=frozenset(declared),
+        handler=handler,
+        timeout=float(getattr(config, "approval_timeout", 30.0)),
+        agent_name=agent_name,
+    )
+
+
 def needs_approval(tool_name: str, declared: set[str]) -> bool:
     """Is ``tool_name`` one the operator asked to be approved?
 
