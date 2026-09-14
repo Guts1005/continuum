@@ -1,6 +1,6 @@
 # Data labels & policy control — the core mechanic
 
-**Clinic guides** — [Setup & index](TESTING_GUIDE.md) · [Labels & policy](labels-and-policy.md) · [F6 memory](F6-memory.md) · [F3 server trust](F3-server-trust.md) · [Namespacing](namespacing.md)
+**Clinic guides** — [Setup & index](TESTING_GUIDE.md) · [Labels & policy](labels-and-policy.md) · [F6 memory](F6-memory.md) · [F3 server trust](F3-server-trust.md) · [F7 approval](F7-approval.md) · [Namespacing](namespacing.md)
 
 > Commands in this guide run from `playground/data-label-clinic/`, one level
 > up from this file.
@@ -206,6 +206,13 @@ differ only by whether a PHI tool was hit.
 - **What it proves:** a tainted run is blocked from exfiltration tools, and
 the denial is reported to the model (soft-fail by design), not a silent
 crash.
+
+> **A second gate sits on the same call.** The policy check here decides *may
+> this run use this tool*, by rule, with no human and no sight of the arguments.
+> A human-in-the-loop gate then decides *should this call, with these arguments,
+> happen* — see [F7 approval](F7-approval.md). It is configured on the agent
+> (`tool_approval`) rather than written as a policy resource, because "allow, but
+> ask someone first" is not something an allow/deny rule can express.
 
 ## Test 3 — telemetry redaction
 4. Click **"inspect (clean)"** then **"inspect (PHI)"**. Clean -> full payload
