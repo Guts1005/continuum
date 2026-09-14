@@ -129,45 +129,56 @@ async def _run_tool_service(service_cls, *, streaming: bool):
     return captured
 
 
-class TestTheTemporalRouteIsNotAvailableYet:
-    """Wiring the existing HITL primitive as a handler does not work today, and
-    the reason is structural rather than missing glue.
+class TestTheTemporalRouteIsNowAvailable:
+    """This class used to assert the opposite, and the change is the point.
 
-    ``HumanInLoopManager`` is the decision-SUBMISSION side -- approve, reject,
-    submit_decision -- the API a reviewer's UI calls. The waiting lives inside
-    the workflow (``_run_approval_step``), which appends to ``_pending_approvals``
-    and blocks on a signal. Nothing outside the workflow can register a request:
-    that list is only ever appended to by workflow code.
+    It held two facts: HumanInLoopManager has no ask-and-wait API, and nothing
+    outside the workflow can register an approval -- ``_pending_approvals`` was
+    appended to in exactly one place, inside ``_run_approval_step``. Both were
+    true, and together they meant the durable route could not be built.
 
-    And an approval handler runs wherever the tool call runs, which under
-    Temporal is inside an ACTIVITY. Workflow APIs -- signals, wait_condition,
-    workflow.info() -- are unavailable there by design.
-
-    So the adapter needs workflow-side support that does not exist: a signal to
-    register an ad-hoc approval, and a query to read its decision. Asserted here
-    so the gap is a tested fact rather than a note someone may not read.
+    The second is no longer true: ``request_tool_approval`` is a signal an
+    activity can send. The old test failed the moment that landed, which is what
+    a tripwire is for -- it named the decision instead of letting a stale
+    assertion quietly pass. It is replaced here rather than deleted so the
+    constraint that replaced it is guarded in turn.
     """
 
-    def test_the_manager_has_no_ask_and_wait_api(self):
-        from continuum.temporal.human_in_loop import HumanInLoopManager
+    def test_a_workflow_can_be_asked_to_register_an_approval(self):
+        from continuum.temporal.workflows.agent_workflow import AgentWorkflow
 
-        assert not hasattr(HumanInLoopManager, "request_and_wait"), (
-            "an ask-and-wait API appeared — the adapter may now be buildable; "
-            "see the module docstring before assuming it is"
-        )
+        assert hasattr(AgentWorkflow, "request_tool_approval")
+        assert hasattr(AgentWorkflow, "get_approval_decision")
 
-    def test_pending_approvals_are_only_created_inside_the_workflow(self):
+    def test_one_signal_still_serves_both_kinds_of_approval(self):
+        """A tool approval must not become a second door into the workflow. The
+        reviewer's side -- submit_approval, the allow-list check -- stays shared,
+        or the two paths drift and one of them ends up weaker."""
         import inspect
 
         from continuum.temporal.workflows import agent_workflow
 
         src = inspect.getsource(agent_workflow)
-        appends = [ln for ln in src.splitlines() if "_pending_approvals.append" in ln]
-        assert len(appends) == 1, (
-            "more than one place creates pending approvals — check whether one of "
-            "them is reachable from outside the workflow"
+        assert src.count("async def submit_approval") == 1, (
+            "a second decision-submission entry point appeared; the allow-list "
+            "check can now be bypassed by signalling the other one"
         )
-        assert "_run_approval_step" in src
+        assert "is_authorized(step, decision)" in src, (
+            "the shared authorization rule is no longer applied"
+        )
+
+    def test_an_unreachable_workflow_defers_rather_than_denying(self):
+        """The adapter's honesty property, asserted from the wiring side too:
+        Temporal being down is not a reviewer saying no."""
+        import inspect
+
+        from continuum.temporal import approval_adapter
+
+        src = inspect.getsource(approval_adapter)
+        assert "deferred=True" in src
+        assert "approved=True," not in src.split("def handler")[0], (
+            "a failure path returns approval"
+        )
 
 
 def _request(tool: str = "send_referral_email", **kwargs):
