@@ -91,6 +91,12 @@ class MemWriteRequest(BaseModel):
     user_id: str = "u1"
 
 
+class ApprovalDecideRequest(BaseModel):
+    request_id: str
+    approved: bool
+    reviewer: str = "ui"
+
+
 class MemDeleteRequest(BaseModel):
     memory_id: str
 
@@ -319,6 +325,29 @@ async def memory_delete(req: MemDeleteRequest):
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.get("/approval/pending")
+async def approval_pending():
+    """What a reviewer should be shown right now (finding F7).
+
+    Polled on a SECOND connection while POST /chat is still open and blocked
+    inside the tool executor: the decision cannot come back on the request that
+    is waiting for it.
+    """
+    from approval_ui import pending_approvals
+
+    return {"pending": pending_approvals()}
+
+
+@app.post("/approval/decide")
+async def approval_decide(req: ApprovalDecideRequest):
+    """Resolve a waiting approval. ok=False means there was nothing to resolve --
+    already answered, or the SDK's approval_timeout already fired and denied it."""
+    from approval_ui import submit_decision
+
+    ok = submit_decision(req.request_id, req.approved, reviewer=req.reviewer)
+    return {"ok": ok}
 
 
 @app.post("/memory/approve")
@@ -558,6 +587,10 @@ async function sendMsg(){
   if(document.getElementById('stream-toggle').checked){ return sendMsgStream(text); }
   add('user', text); input.value=''; send.disabled=true;
   const thinking=add('thinking','…');
+  // F7: poll for approval prompts on a SECOND connection. /chat is blocked
+  // inside the tool executor waiting for an answer, so it cannot deliver the
+  // question that is blocking it.
+  const stopPolling=pollApprovals();
   try{
     const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:text,user_id:USER_ID,conversation_id:currentConversationId,scanner_on:scannerOn()})});
@@ -567,7 +600,49 @@ async function sendMsg(){
     if(d.failed){ renderUnknown(); } else { renderTaint(d.taint); renderModel(d.model_used); renderTools(d.tools_called); renderGates(d.gate_events); }
     listMem();      // long-term memory may have changed (stored, or blocked)
   }catch(e){ thinking.textContent='Error: '+e; }
+  stopPolling();
   send.disabled=false; input.focus();
+}
+
+// F7 approval prompts. Arguments are shown, not just the tool name: a reviewer
+// shown only a name is approving the name, and the arguments are the whole
+// reason this gate exists -- neither tool-trust nor the policy gate sees them.
+function pollApprovals(){
+  let live=true; const shown=new Set();
+  (async()=>{
+    while(live){
+      try{
+        const r=await fetch('/approval/pending'); const d=await r.json();
+        for(const p of (d.pending||[])){
+          if(shown.has(p.request_id)) continue;
+          shown.add(p.request_id); renderApproval(p);
+        }
+      }catch(e){ /* the turn may have ended; the loop exits on stopPolling */ }
+      await new Promise(r=>setTimeout(r,400));
+    }
+  })();
+  return ()=>{ live=false; };
+}
+
+function renderApproval(p){
+  const el=add('thinking','');
+  const labels=(p.data_labels||[]).length
+    ? ' <span class="chip phi">'+p.data_labels.join(', ')+'</span>' : '';
+  el.innerHTML='<b>&#9208; APPROVAL NEEDED</b>'+labels+'<br><code>'+p.tool_name+'</code>'
+    +'<pre style="margin:6px 0;white-space:pre-wrap">'+JSON.stringify(p.arguments,null,1)+'</pre>'
+    +'<button class="demo-btn" onclick="decideApproval(\''+p.request_id+'\',true,this)">approve</button> '
+    +'<button class="demo-btn" onclick="decideApproval(\''+p.request_id+'\',false,this)">deny</button>';
+}
+
+async function decideApproval(id, approved, btn){
+  btn.parentElement.querySelectorAll('button').forEach(b=>b.disabled=true);
+  const r=await fetch('/approval/decide',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({request_id:id, approved:approved, reviewer:'ui'})});
+  const d=await r.json();
+  btn.parentElement.innerHTML += d.ok
+    ? '<br><i>'+(approved?'approved':'denied')+'</i>'
+    : '<br><i>too late &mdash; the approval already timed out and was denied</i>';
 }
 
 async function sendMsgStream(text){

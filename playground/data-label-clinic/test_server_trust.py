@@ -23,6 +23,7 @@ be fully persuaded by a poisoned description and still fail to reach the tool.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import pathlib
@@ -961,3 +962,192 @@ class TestPharmacyOverStdio:
         for transport in ("streamable-http", "sse", "stdio"):
             for server in self._servers(transport).values():
                 assert agent.server_address(server)
+
+
+# ── F7: the human-in-the-loop approval gate ──────────────────────────────────
+
+
+class TestApprovalModes:
+    """CLINIC_APPROVAL picks who answers, the way CLINIC_FILTER picks a filter.
+
+    The gate is SDK-level; what the clinic supplies is the declaration (which
+    tools) and the handler (who answers). `off` stays the shipped default so the
+    demo starts in the state a new project is in.
+
+    The gated tool is check_interactions, not send_referral_email. That was the
+    first choice and a live run rejected it: ask for a referral email and the
+    model looks the patient up first, tainting the run PHI so the policy denies
+    the call before approval is consulted; forbid the lookup and the model
+    declines to send mail at all. A gate nothing reaches demonstrates nothing --
+    the same reason check_interactions carries the EXTERNAL rule in BM4.
+    """
+
+    def _build(self, monkeypatch, mode):
+        import importlib
+
+        import config as clinic_config
+
+        monkeypatch.setenv("CLINIC_APPROVAL", mode)
+        importlib.reload(clinic_config)
+        return clinic_config
+
+    def test_off_declares_no_tools(self, monkeypatch):
+        cfg = self._build(monkeypatch, "off")
+        assert cfg.build_approval_tools() == set()
+        assert cfg.build_approval_handler() is None
+
+    def test_auto_declares_the_gated_tool(self, monkeypatch):
+        cfg = self._build(monkeypatch, "auto")
+        assert cfg.APPROVAL_TOOL in cfg.build_approval_tools()
+        assert cfg.build_approval_handler() is not None
+
+    async def test_auto_approves_without_a_person(self, monkeypatch):
+        """So a scripted run can exercise the approved path end to end."""
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._build(monkeypatch, "auto")
+        decision = await cfg.build_approval_handler()(
+            ToolApprovalRequest(
+                tool_name=cfg.APPROVAL_TOOL,
+                arguments={"medications": ["metformin", "lisinopril"]},
+                agent_name="clinic",
+            )
+        )
+        assert decision.approved
+
+    async def test_deny_refuses_and_says_why(self, monkeypatch):
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._build(monkeypatch, "deny")
+        decision = await cfg.build_approval_handler()(
+            ToolApprovalRequest(tool_name=cfg.APPROVAL_TOOL, arguments={}, agent_name="clinic")
+        )
+        assert not decision.approved
+        assert decision.reason
+
+    def test_ask_wires_the_ui_handler(self, monkeypatch):
+        """`ask` is the mode that actually blocks on a person; the handler comes
+        from approval_ui so the prompt can reach a browser."""
+        cfg = self._build(monkeypatch, "ask")
+        assert cfg.APPROVAL_TOOL in cfg.build_approval_tools()
+        assert cfg.build_approval_handler() is not None
+
+    def test_an_unknown_mode_gates_nothing_rather_than_guessing(self, monkeypatch):
+        cfg = self._build(monkeypatch, "wat")
+        assert cfg.build_approval_tools() == set()
+
+    def test_the_timeout_is_switchable_and_defaults_http_safe(self, monkeypatch):
+        """A blocked run holds the HTTP request open, so the default has to sit
+        inside ordinary proxy limits rather than match how long a reviewer takes.
+        """
+        cfg = self._build(monkeypatch, "off")
+        assert 0 < cfg.approval_timeout() <= 60
+        monkeypatch.setenv("CLINIC_APPROVAL_TIMEOUT", "3")
+        assert cfg.approval_timeout() == 3.0
+        monkeypatch.setenv("CLINIC_APPROVAL_TIMEOUT", "not-a-number")
+        assert cfg.approval_timeout() == 30.0
+
+
+class TestTheUiApprovalHandler:
+    """`ask` parks the tool call on a future that a SECOND request resolves.
+    POST /chat is already blocked inside the tool executor, so the decision
+    cannot come back on the connection that is waiting for it."""
+
+    async def test_a_pending_prompt_carries_the_arguments(self):
+        import asyncio
+
+        from approval_ui import pending_approvals, submit_decision, ui_approval_handler
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        req = ToolApprovalRequest(
+            tool_name="pharmacy__check_interactions",
+            arguments={"medications": ["metformin", "lisinopril"]},
+            agent_name="clinic",
+            data_labels=frozenset({"external"}),
+        )
+        task = asyncio.create_task(ui_approval_handler(req))
+        await asyncio.sleep(0)
+
+        pending = pending_approvals()
+        assert len(pending) == 1
+        # A reviewer shown only a tool name is approving the name. The arguments
+        # are the whole reason this gate exists.
+        assert pending[0]["arguments"] == {"medications": ["metformin", "lisinopril"]}
+        assert pending[0]["data_labels"] == ["external"]
+
+        assert submit_decision(pending[0]["request_id"], approved=True, reviewer="tom")
+        decision = await task
+        assert decision.approved
+        assert decision.reviewer == "tom"
+
+    async def test_answering_twice_is_refused(self):
+        """The second click must not resolve a future that is already done."""
+        import asyncio
+
+        from approval_ui import pending_approvals, submit_decision, ui_approval_handler
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        task = asyncio.create_task(
+            ui_approval_handler(
+                ToolApprovalRequest(tool_name="t", arguments={}, agent_name="clinic")
+            )
+        )
+        await asyncio.sleep(0)
+        rid = pending_approvals()[0]["request_id"]
+        assert submit_decision(rid, approved=True)
+        await task
+        assert not submit_decision(rid, approved=False), "a resolved prompt was answered again"
+
+    async def test_an_abandoned_prompt_does_not_linger(self):
+        """When the SDK's timeout cancels the handler, the prompt must leave the
+        panel -- otherwise it sits there claiming to be live and a click reports
+        'too late' with no explanation of why."""
+        import asyncio
+
+        from approval_ui import pending_approvals, ui_approval_handler
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        task = asyncio.create_task(
+            ui_approval_handler(
+                ToolApprovalRequest(tool_name="t", arguments={}, agent_name="clinic")
+            )
+        )
+        await asyncio.sleep(0)
+        assert pending_approvals()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert pending_approvals() == []
+
+    async def test_deciding_an_unknown_id_is_reported_not_raised(self):
+        from approval_ui import submit_decision
+
+        assert not submit_decision("no-such-id", approved=True)
+
+
+class TestTheAgentDeclaresApproval:
+    def test_the_agent_passes_all_three_fields(self):
+        """Declaring tools without a handler is the misconfiguration the SDK
+        warns about, so the clinic sets both from one place and they cannot
+        drift apart."""
+        import inspect
+
+        import agent as clinic_agent
+
+        src = inspect.getsource(clinic_agent)
+        assert "tool_approval=" in src
+        assert "approval_handler=" in src
+        assert "approval_timeout=" in src
+
+    def test_an_approval_denial_reaches_the_glassbox(self):
+        """The panel is the whole point of the clinic. A refusal that does not
+        appear there is indistinguishable from the tool quietly not running."""
+        import inspect
+
+        import agent as clinic_agent
+
+        src = inspect.getsource(clinic_agent)
+        assert "APPROVAL DENIED" in src, "approval denials are not surfaced as gate events"

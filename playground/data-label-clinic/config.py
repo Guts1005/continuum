@@ -27,6 +27,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -55,6 +56,9 @@ for _var in (
         os.environ.pop(_var, None)
 
 from continuum.security.policy import AccessPolicy, PolicyStore
+
+if TYPE_CHECKING:
+    from continuum.agent.approval import ToolApprovalDecision, ToolApprovalRequest
 
 # --- the PHI label -------------------------------------------------------- #
 PHI = "phi"
@@ -329,6 +333,95 @@ def build_pre_store_filter() -> Callable[[list[str]], list[str]] | None:
         return _pii_pre_store_filter
     if mode == "broken":
         return _broken_pre_store_filter
+    return None
+
+
+# --- human-in-the-loop approval (the SDK's tool_approval hook, finding F7) -- #
+#
+# The gate is SDK-level: it fires inside the tool executor, receives the call's
+# ARGUMENTS, and fails closed. What the clinic supplies is the declaration (which
+# tools) and the handler (who answers) -- the SDK ships neither, because a
+# default list of "risky" names blocks a harmless send_receipt while missing
+# wire_funds.
+#
+# check_interactions, for the same reason it carries the EXTERNAL policy rule:
+# it is the consequential action the model will actually attempt. The obvious
+# choice was send_referral_email, and a live run showed why it does not work --
+# the model refuses to send mail until it has looked a patient up, and that
+# lookup taints the run PHI, so phi-no-exfiltration-tools denies the call before
+# approval is ever consulted. Both failure modes were observed: with a patient
+# lookup the policy fires first, without one the model declines by itself. A
+# gate nothing reaches demonstrates nothing.
+#
+# The pairing is the point. BM4 shows the policy DENYING check_interactions to
+# an EXTERNAL run; BM11 shows a person being ASKED about it on a clean one --
+# the same action, the two postures, and the difference between a rule deciding
+# and a human deciding.
+
+APPROVAL_TOOL = "pharmacy__check_interactions"
+
+
+async def _auto_approve(request: ToolApprovalRequest) -> ToolApprovalDecision:
+    """Approve without a person, so a scripted run can reach the approved path."""
+    from continuum.agent.approval import ToolApprovalDecision
+
+    return ToolApprovalDecision(approved=True, reviewer="auto (CLINIC_APPROVAL=auto)")
+
+
+async def _always_deny(request: ToolApprovalRequest) -> ToolApprovalDecision:
+    """Refuse every request -- the denial path without waiting on a human."""
+    from continuum.agent.approval import ToolApprovalDecision
+
+    return ToolApprovalDecision(
+        approved=False,
+        reviewer="auto (CLINIC_APPROVAL=deny)",
+        reason="Refused by the scripted reviewer.",
+    )
+
+
+def approval_timeout() -> float:
+    """How long the gate waits for a person.
+
+    Switchable because the limit is the point: a blocked run holds the HTTP
+    request open, so this has to stay inside browser and proxy limits rather
+    than match how long a reviewer actually takes. Set it to 3 and walk away to
+    watch it fail closed.
+    """
+    try:
+        return float(os.environ.get("CLINIC_APPROVAL_TIMEOUT", "30"))
+    except ValueError:
+        return 30.0
+
+
+def build_approval_tools() -> set[str]:
+    """Which tools need a person. Empty unless CLINIC_APPROVAL asks for one."""
+    if os.environ.get("CLINIC_APPROVAL", "off") in ("auto", "deny", "ask"):
+        return {APPROVAL_TOOL}
+    return set()
+
+
+def build_approval_handler():
+    """Who answers.
+
+    off (default) -- nobody, and nothing is declared either, so the gate is
+        inert. This is the state a new project starts in.
+    auto -- approve programmatically. For scripted runs that need the approved
+        path without a browser.
+    deny -- refuse programmatically. Shows what the model is told when a person
+        says no, without waiting for one.
+    ask -- a real prompt in the web UI. The handler lives in web.py because it
+        has to reach a browser; this returns it lazily so importing config does
+        not drag in FastAPI.
+    """
+    mode = os.environ.get("CLINIC_APPROVAL", "off")
+    if mode == "auto":
+        return _auto_approve
+    if mode == "deny":
+        return _always_deny
+    if mode == "ask":
+        from approval_ui import ui_approval_handler
+
+        return ui_approval_handler
     return None
 
 
