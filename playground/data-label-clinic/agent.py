@@ -28,7 +28,13 @@ from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
-from config import PHI, ClinicConfig, build_policy_store, default_config
+from config import (
+    PHI,
+    ClinicConfig,
+    build_policy_store,
+    build_pre_store_filter,
+    default_config,
+)
 
 from continuum import (
     AgentConfig,
@@ -42,7 +48,11 @@ from continuum import (
     ToolExecutor,
     get_logger,
 )
-from continuum.agent.exceptions import MemoryAccessDeniedError, ModelAccessDeniedError
+from continuum.agent.exceptions import (
+    MemoryAccessDeniedError,
+    MemoryReviewRequiredError,
+    ModelAccessDeniedError,
+)
 from continuum.agent.types import EventType, generate_run_id
 from continuum.core.container import Container, get_container
 from continuum.core.lifecycle import OrchestratorLifecycle, get_lifecycle_manager
@@ -92,7 +102,7 @@ def build_trust_config(*, strict: bool = False) -> ToolTrustConfig:
         #
         # Non-strict is "warn", not the SDK default of "block": a fresh clone
         # has no tool-pins.json and this is a demo people should be able to
-        # start before reading TESTING_GUIDE.md. Not "allow" either -- being
+        # start before reading docs/TESTING_GUIDE.md. Not "allow" either -- being
         # told the catalogue is unreviewed is the right first thing to see.
         on_unreviewed="block" if strict else "warn",
         on_drift="block" if strict else "warn",
@@ -130,7 +140,7 @@ def build_mcp_servers(*, config: ClinicConfig | None = None) -> list[MCPServer]:
     rather than CLI flags, applied one level up.
 
     CLINIC_PIN_GATE=1 upgrades both trust knobs from "report it" to "drop it"
-    (TESTING_GUIDE.md Layer C, scenario C3). Reporting is the default because a
+    (docs/F3-server-trust.md, scenario C3). Reporting is the default because a
     description a developer edited on purpose is the common case.
     """
     cfg = config or default_config
@@ -238,7 +248,7 @@ class ClinicAgent:
         everything callable.
         """
         # CLINIC_PIN_GATE=1 upgrades drift from "report it" to "drop the tool"
-        # (TESTING_GUIDE.md Layer C, scenario C3). Reporting is the default
+        # (docs/F3-server-trust.md, scenario C3). Reporting is the default
         # because a description a developer edited on purpose is the common
         # case; dropping is what you want once the catalogue is one you trust.
         self._mcp_servers = build_mcp_servers(config=self.config)
@@ -274,6 +284,13 @@ class ClinicAgent:
                 store_scope=AgentMemoryScope.USER,
                 # read=taint: reading this scope taints the run with PHI.
                 scope_data_labels=self.config.scope_data_labels,
+                # what a recalled row carrying provenance does (F6): fence it,
+                # drop it, or refuse the turn until a person reviews it.
+                on_labeled_recall=self.config.recall_action,
+                # CLINIC_FILTER: content filter over the facts mem0 extracted.
+                # Off by default -- the SDK ships no detector. See
+                # config.build_pre_store_filter for what each mode shows.
+                pre_store_filter=build_pre_store_filter(),
             ),
             config=AgentConfig(
                 max_turns=self.config.max_turns,
@@ -357,6 +374,31 @@ class ClinicAgent:
             resp, ctx = await self._run_once(
                 message, self.config.cloud_model, user_id, conversation_id, session_id
             )
+        except MemoryReviewRequiredError as e:
+            # on_labeled_recall="block". Not a fault: the recalled rows carry
+            # provenance no person has cleared, and this agent is configured to
+            # stop rather than use them. Reported WITH the row ids so the panel
+            # can point a reviewer straight at them -- a block with no route to
+            # review is an outage, not a workflow.
+            self._agent.model = self.config.cloud_model
+            self._apply_scanner(True)
+            ids = ", ".join(i[:8] for i in e.memory_ids)
+            return {
+                "response": (
+                    f"Turn stopped: {len(e.memory_ids)} recalled memory row(s) carry "
+                    f"unreviewed provenance {e.labels}. Approve or delete them in the "
+                    f"LONG-TERM MEMORY panel, then ask again."
+                ),
+                "review_required": True,
+                "taint": [],
+                "model_used": None,
+                "gate_events": [
+                    f"🛡️ MEMORY RECALL — turn refused: {len(e.memory_ids)} row(s) "
+                    f"labelled {e.labels} awaiting review (ids: {ids}). "
+                    f"CLINIC_RECALL='block'."
+                ],
+                "tools_called": [],
+            }
         except ModelAccessDeniedError as e:
             # The PHI taint tripped the cloud-model deny mid-run. Re-run on the
             # PHI-approved on-prem model (the compliant fallback).
@@ -622,8 +664,23 @@ class ClinicAgent:
     ) -> dict[str, Any]:
         """Demonstrate the MEMORY-WRITE gate: try to persist `text` to the USER
         scope carrying `labels`. With PHI the policy ``phi-never-persisted``
-        (memory:*) denies it; without labels it is stored and becomes visible in
-        the long-term-memory panel.
+        (``memory:write:*``) denies it; without labels it is stored and becomes
+        visible in the long-term-memory panel.
+
+        ``infer=False``: store the text verbatim instead of asking mem0's
+        extractor to derive facts from it. Two reasons, and the second is the
+        one that matters.
+
+        The panel then shows what was actually submitted rather than an LLM
+        paraphrase of it, which is what a button labelled "save note" should
+        mean.
+
+        And it is the only setting under which hidden-character stripping can be
+        observed at all (BM10). With extraction on, the model rewrites the text,
+        so the stored row comes back free of invisible codepoints whether or not
+        ``strip_hidden_chars`` ever ran -- the payload is laundered by the
+        paraphrase and the test passes vacuously. Verbatim storage is what makes
+        the check falsifiable.
 
         Only meaningful when memory is enabled (needs mem0 + a vector store);
         otherwise we report skipped — the gate runs after _ensure_enabled().
@@ -642,6 +699,7 @@ class ClinicAgent:
                 policy_store=self._policy_store,
                 subject=self.config.agent_name,
                 data_labels=set(labels),
+                infer=False,
             )
             return {"ok": True, "denied": False, "stored": text}
         except MemoryAccessDeniedError as e:

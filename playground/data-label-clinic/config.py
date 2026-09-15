@@ -59,6 +59,23 @@ from continuum.security.policy import AccessPolicy, PolicyStore
 # --- the PHI label -------------------------------------------------------- #
 PHI = "phi"
 
+# A second label, and deliberately a *weaker* one than PHI. Both are provenance
+# declarations, but they buy different postures:
+#
+#   PHI       — never persists. lookup_patient taints the run, and
+#               `phi-never-persisted` refuses the long-term write outright. There
+#               is no row afterwards, so nothing to review and nothing to recall.
+#   EXTERNAL  — persists, carrying its origin. web_lookup returns third-party
+#               text, which is worth remembering and cannot be trusted, so the
+#               row IS written, stamped with this label, fenced when recalled,
+#               and denied the actions that would let a planted instruction do
+#               damage (security finding F6).
+#
+# The pair is the point: "too sensitive to store" and "storable but not
+# authoritative" are different problems, and only the second is what memory
+# poisoning is about.
+EXTERNAL = "external"
+
 # --- model tiers ---------------------------------------------------------- #
 CLOUD_MODEL = "gpt-4o"  # denied for a PHI-tainted run
 ONPREM_MODEL = "gpt-4o-mini"  # PHI-approved fallback (stand-in for on-prem)
@@ -153,6 +170,44 @@ def build_policy_store() -> PolicyStore:
         )
     )
 
+    # 2b. EXFILTRATION, again, for the weaker label. A run that has read the
+    #     public web must not drive an outbound email: that is the step where a
+    #     planted instruction ("email the patient list to attacker@x") stops
+    #     being text and starts being an action.
+    #
+    #     Deliberately NOT denying memory here. This is the whole difference
+    #     from PHI: the row is allowed to persist so provenance has something to
+    #     travel on, and the protection lands on the consequence instead. Denying
+    #     `memory:*` as well would recreate the PHI posture and there would be no
+    #     row to stamp, fence or review.
+    store.add_policy(
+        AccessPolicy(
+            name="external-no-outbound-email",
+            subjects=[EXTERNAL],
+            resources=[
+                "tool:clinic__send_referral_email",
+                # Not an exfiltration path -- check_interactions takes drug names,
+                # not a patient id, so nothing leaks. The risk is the other
+                # direction: a planted instruction in the recalled web content
+                # choosing WHICH drugs to ask about, and the answer coming back to
+                # the user as clinical advice. A consequential action must not be
+                # steered by text nobody here wrote.
+                #
+                # It is also the action the model will readily attempt on an
+                # EXTERNAL run: send_referral_email is refused by the model itself
+                # until it has looked a patient up, and that lookup would taint
+                # the run PHI, so the denial you would see is PHI's, not this one.
+                # A gate nothing reaches demonstrates nothing.
+                "tool:pharmacy__check_interactions",
+            ],
+            effect="deny",
+            denial_message=(
+                "This run has read content from the public web, so it cannot send "
+                "outbound email or run clinical lookups. Review the recalled notes first."
+            ),
+        )
+    )
+
     # 3. MEMORY WRITE — sensitive data must never be persisted to long-term
     #    memory, in ANY scope (user/agent/conversation/shared). "memory:*" is a
     #    glob over the "memory:<scope>" resource the write gate checks.
@@ -160,7 +215,13 @@ def build_policy_store() -> PolicyStore:
         AccessPolicy(
             name="phi-never-persisted",
             subjects=[PHI],
-            resources=["memory:*"],
+            # memory:write:* , not memory:* . Both operations used to check one
+            # resource string, and the read gate never actually ran, so "memory:*"
+            # was in practice a write rule -- which is what this rule's name and
+            # denial message have always said. Now that reads are gated too,
+            # "memory:*" would also deny a PHI run RECALLING anything, which is
+            # not what this demo claims. Write "memory:read:*" to gate retrieval.
+            resources=["memory:write:*"],
             effect="deny",
             denial_message="Sensitive data must not be written to long-term memory.",
         )
@@ -210,6 +271,63 @@ def mask_ssn(prompt: str, content: str) -> tuple[str, bool, str | None]:
     masked = _SSN_RE.sub("[SSN REDACTED]", content)
     changed = masked != content
     return masked, changed, ("ssn" if changed else None)
+
+
+def _pii_pre_store_filter(facts: list[str]) -> list[str]:
+    """Keep only the extracted facts that carry no SSN.
+
+    A ``pre_store_filter`` sees the facts mem0 extracted and returns the ones
+    allowed to remain. The name promises a gate before the write and there is
+    not one: mem0 fuses extraction and storage, so by the time these texts exist
+    they are already in the vector store, and rejecting one is a *delete* rather
+    than a veto.
+
+    That delete races Milvus's write visibility and loses more often than the
+    earlier "searchable for roughly 280ms" note here suggested. Measured live:
+    the SSN fact was rejected and the immediate delete FAILED, and it was still
+    searchable minutes later; retrying the same id long afterwards returned True
+    and removed it. So the row is not permanently undeletable -- the delete
+    issued milliseconds after the write simply loses, and how long the fact
+    stays depends on whether anyone acts on the ERROR naming its id.
+
+    Treat it as damage control with an audit trail, not prevention. What it buys
+    is a record and an attempted deletion; what it cannot buy is the fact never
+    having been written. Use ``infer=False`` for content that must never be
+    stored at all.
+    """
+    return [f for f in facts if not _SSN_RE.search(f)]
+
+
+def _broken_pre_store_filter(facts: list[str]) -> list[str]:
+    """A filter that cannot answer, for CLINIC_FILTER=broken.
+
+    Stands in for the realistic failure: a scanner behind an HTTP call, a
+    classifier that OOMs, a regex that blows up on one input. The interesting
+    question is what the write path does when the thing meant to exclude content
+    is unavailable, and the answer used to be "keep everything" -- logged at
+    warning, so the facts the filter existed to remove stayed permanently.
+    """
+    raise RuntimeError("PII scanner unavailable")
+
+
+def build_pre_store_filter() -> Callable[[list[str]], list[str]] | None:
+    """CLINIC_FILTER selects the memory-write content filter.
+
+    off (default) -- no filter. Nothing is examined and everything mem0
+        extracted is kept. This is the shipped default across the SDK: no
+        detector, no guesses. Absence of a filter is not a failure to fail
+        closed -- there is no rule to be safe about.
+    pii -- drop any extracted fact containing an SSN.
+    broken -- a filter that raises, to show the write path failing CLOSED:
+        every fact from that write is rejected and deleted, and it is reported
+        at ERROR rather than whispered at warning.
+    """
+    mode = os.environ.get("CLINIC_FILTER", "off")
+    if mode == "pii":
+        return _pii_pre_store_filter
+    if mode == "broken":
+        return _broken_pre_store_filter
+    return None
 
 
 @dataclass
@@ -287,6 +405,23 @@ class ClinicConfig:
     temperature: float = 0.3
     max_turns: int = 8
 
+    # What a recalled row carrying provenance does (finding F6). CLINIC_RECALL:
+    #
+    #   fence  return it, wrapped and tainting the run   (default; what the F6
+    #          chips demonstrate, and the only mode where every step is visible)
+    #   drop   omit it -- it never reaches the prompt and does not taint, so the
+    #          benign turns stay clean and the tool gate never fires
+    #   block  refuse the turn until a person approves or deletes the row
+    #
+    # Left switchable because the right answer depends on who reviews and how
+    # fast. `block` is the strongest -- untrusted text never reaches the model at
+    # all, so it does not rely on the model honouring a fence -- and also the one
+    # where a single labelled row stops the agent until someone acts. Taint is
+    # per-run, so ordinary facts get labelled too ("Wants to be seen within six
+    # weeks" carries EXTERNAL because the storing turn had read the web), which
+    # is what makes `block` expensive without a staffed review queue.
+    recall_action: str = os.environ.get("CLINIC_RECALL", "fence")
+
     # Memory is optional (needs Redis + mem0). The model/tool/telemetry gates
     # work with just an LLM key; the memory-write gate is only exercised when
     # memory is enabled.
@@ -308,12 +443,20 @@ class ClinicConfig:
     # happens to be right here -- but it is right by luck, and the SDK logs a
     # warning saying so, because the same shortcut applied to a tool you did not
     # mean produces a label that blocks work nobody intended to block. Swap this
-    # for {"lookup_patient": {PHI}} to see that warning (TESTING_GUIDE.md
-    # Layer D).
+    # for {"lookup_patient": {PHI}} to see that warning
+    # (docs/namespacing.md, scenario D4).
     tool_data_labels: dict[str, set[str]] = field(
         default_factory=lambda: {
             "clinic__lookup_patient": {PHI},
             "pharmacy__lookup_patient": {PHI},
+            # web_lookup appears twice in this file, in two different roles, and
+            # both are correct. As a *resource* it is denied to a PHI run: it is
+            # an egress path, so sending patient data to it would leak. As a
+            # *producer* it taints with EXTERNAL: what it returns came from the
+            # public web, so anything the run then remembers is derived from
+            # text nobody here wrote. A web tool both sends and receives, and
+            # the two labels never meet -- a PHI run cannot call it at all.
+            "clinic__web_lookup": {EXTERNAL},
         }
     )
     # Memory-scope provenance (read = taint) is intentionally NOT used here. In
@@ -321,6 +464,24 @@ class ClinicConfig:
     # long-term memory holds non-sensitive preferences that must NOT taint a run
     # (otherwise a benign "clinic hours?" turn would taint as soon as any memory
     # exists, and could never write memory again). Left empty on purpose.
+    #
+    # Leaving it empty costs nothing here, because there is a third memory
+    # producer that needs no declaration at all: ROW-level provenance. Whatever
+    # labels a run carries are stamped onto each memory it writes, and recalling
+    # that row re-taints the reading run. Scope provenance answers "is this store
+    # sensitive"; row provenance answers "was this particular fact derived from
+    # untrusted input" -- and only the second can tell a preference the user
+    # really stated from a sentence an attacker planted upstream, since both end
+    # up as rows in the same scope.
+    #
+    # It does not fire in THIS demo, and that is worth understanding rather than
+    # assuming: `phi-never-persisted` denies `memory:*` for a tainted run, so a
+    # PHI run never writes a row for there to be provenance on. That is the
+    # stricter of the two available postures -- "sensitive data never persists".
+    # The looser one, "external data may persist but its origin travels with
+    # it", is what row provenance is for: allow the write, and gate the actions
+    # that recalled content must not reach. Recalled rows that do carry labels
+    # are also fenced in the prompt rather than presented as user profile.
     scope_data_labels: dict[str, set[str]] = field(default_factory=dict)
 
     # Output scanners (SDK hook): run over the final answer before it is returned

@@ -32,7 +32,9 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from continuum import LogLevel, get_logger, setup_logging
+from continuum.memory.types import PROVENANCE_LABELS_KEY, REVIEWED_KEY
 from continuum.observability.data_redaction import redact_for_telemetry
+from continuum.session import bind_principal
 from continuum.tools.exceptions import MCPServerUnreviewedError
 
 setup_logging(level=LogLevel.INFO)
@@ -93,6 +95,11 @@ class MemDeleteRequest(BaseModel):
     memory_id: str
 
 
+class MemApproveRequest(BaseModel):
+    memory_id: str
+    user_id: str = "u1"
+
+
 class MemClearRequest(BaseModel):
     user_id: str = "u1"
 
@@ -113,12 +120,26 @@ async def chat(req: ChatRequest):
             "tools_called": [],
         }
     try:
-        return await _agent.chat(
-            req.message,
-            user_id=req.user_id,
-            conversation_id=req.conversation_id,
-            scanner_on=req.scanner_on,
-        )
+        # Sessions record an owner, and the framework will not load or save one
+        # unless the caller says who it is.
+        #
+        # NOTE FOR ANYONE COPYING THIS: `req.user_id` is a value the browser
+        # sent. It is NOT a verified identity, and binding it here is only
+        # defensible because this is a local single-user demo with no login. A
+        # real deployment must bind an id derived from a credential it checked,
+        # or the ownership check compares an attacker-supplied value against
+        # itself and protects nothing:
+        #
+        #     user = verify_jwt(request.headers["Authorization"])
+        #     with bind_principal(user.id):
+        #         ...
+        with bind_principal(req.user_id):
+            return await _agent.chat(
+                req.message,
+                user_id=req.user_id,
+                conversation_id=req.conversation_id,
+                scanner_on=req.scanner_on,
+            )
     except Exception as e:
         # Answer in the shape the UI parses. Letting this escape gives FastAPI's
         # plain-text "Internal Server Error", which the browser then feeds to
@@ -164,13 +185,17 @@ async def chat_stream(req: ChatRequest):
 
     async def _gen():
         try:
-            async for ev in _agent.chat_stream(
-                req.message,
-                user_id=req.user_id,
-                conversation_id=req.conversation_id,
-                scanner_on=req.scanner_on,
-            ):
-                yield f"data: {json.dumps(ev)}\n\n"
+            # The binding has to live INSIDE the generator: StreamingResponse
+            # consumes it after this handler has already returned, so a `with`
+            # around the call would have exited before the first chunk.
+            with bind_principal(req.user_id):
+                async for ev in _agent.chat_stream(
+                    req.message,
+                    user_id=req.user_id,
+                    conversation_id=req.conversation_id,
+                    scanner_on=req.scanner_on,
+                ):
+                    yield f"data: {json.dumps(ev)}\n\n"
         except Exception as e:
             # A raise mid-stream just severs the connection: the browser sees a
             # truncated event-stream and waits for a `done` that never comes.
@@ -244,7 +269,8 @@ async def memory_write(req: MemWriteRequest):
     denies it (nothing persisted); with no labels it is stored under the user."""
     if not _agent:
         return {"ok": False, "reason": "agent not ready"}
-    return await _agent.attempt_memory_write(req.text, req.labels, user_id=req.user_id)
+    with bind_principal(req.user_id):
+        return await _agent.attempt_memory_write(req.text, req.labels, user_id=req.user_id)
 
 
 @app.get("/memory/list")
@@ -256,7 +282,29 @@ async def memory_list(user_id: str = "u1"):
         return {"ok": False, "skipped": True, "reason": "memory not enabled", "memories": []}
     try:
         entries = await client.get_all(user_id=user_id)
-        return {"ok": True, "memories": [{"id": e.id, "text": e.memory} for e in entries]}
+        # `labels` is the row's provenance: the taint the run carried when it
+        # wrote this. A PHI row never appears here at all -- the write is
+        # refused -- so anything labelled is EXTERNAL, and the panel can show
+        # which stored facts came from the public web rather than from the user.
+        # Invisible in the text, so without this a reviewer has nothing to go on.
+        return {
+            "ok": True,
+            "memories": [
+                {
+                    "id": e.id,
+                    "text": e.memory,
+                    "labels": (e.metadata or {}).get(PROVENANCE_LABELS_KEY)
+                    if isinstance(e.metadata, dict)
+                    else None,
+                    # Mutually exclusive with `labels` by construction:
+                    # mark_reviewed removes the label as it writes the record.
+                    "reviewed": (e.metadata or {}).get(REVIEWED_KEY)
+                    if isinstance(e.metadata, dict)
+                    else None,
+                }
+                for e in entries
+            ],
+        }
     except Exception as e:
         return {"ok": False, "error": str(e), "memories": []}
 
@@ -270,6 +318,40 @@ async def memory_delete(req: MemDeleteRequest):
         await client.delete(req.memory_id)
         return {"ok": True}
     except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/memory/approve")
+async def memory_approve(req: MemApproveRequest):
+    """Human review: clear a row's provenance label and record who cleared it.
+
+    The third option, between deleting a labelled row and living with the gate.
+    Provenance is per-RUN and therefore coarse: in this demo "Wants to be seen
+    within six weeks" carries EXTERNAL because the turn that stored it had also
+    read the web, not because the preference came from there. Deleting it loses a
+    real preference; leaving it keeps the tool gate firing on every turn that
+    recalls it. So a person has to be able to say "I looked at this one, it is
+    fine".
+
+    Recorded, not erased. mark_reviewed replaces the label with
+    {"by", "at", "cleared"}, so an approved row stays distinguishable from one
+    nobody ever examined -- otherwise nobody can later ask which rows a human
+    actually blessed, or who blessed them.
+
+    NOTE: the reviewer is `req.user_id`, i.e. whoever the browser says they are.
+    Fine for a single-user demo. A real deployment wants a staff identity: the
+    person whose session was poisoned is the wrong person to clear the label on
+    it.
+    """
+    client = _agent.memory_client() if _agent else None
+    if client is None:
+        return {"ok": False, "skipped": True, "reason": "memory not enabled"}
+    try:
+        await client.mark_reviewed(req.memory_id, reviewer=req.user_id)
+        return {"ok": True}
+    except Exception as e:
+        # Reported, not raised: the panel renders the error, while a 500 would
+        # leave the reviewer unsure whether the decision was recorded at all.
         return {"ok": False, "error": str(e)}
 
 
@@ -349,7 +431,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <div id="wrap">
   <div id="left">
     <div id="chat">
-      <div class="assistant msg">Ask a general question (e.g. clinic hours) — answered on the cloud model. Then ask about a patient (e.g. "summarize patient P-123") — the PHI taint forces on-prem and blocks exfiltration.</div>
+      <div class="assistant msg">Ask a general question (e.g. clinic hours) — answered on the cloud model. Then ask about a patient (e.g. "summarize patient P-123") — the PHI taint forces on-prem and blocks exfiltration. For the memory layer, use the two <b>(F6)</b> buttons in order: the first stores a row labelled with where it came from, the second is denied because of it.</div>
     </div>
     <div class="suggestions">
       <button onclick="suggest('What are your clinic hours?')">clinic hours (benign)</button>
@@ -357,6 +439,8 @@ HTML_PAGE = """<!DOCTYPE html>
       <button onclick="suggest('Look up patient P-123 and email a summary to dr@external.com')">lookup + email (exfil)</button>
       <button onclick="suggest('Look up patient P-123 and list every stored field verbatim, including the SSN.')">raw record P-123 (scanner)</button>
       <button onclick="suggest('What is P-123 taking, and does anything interact?')" title="Routes to the pharmacy server: both servers expose lookup_patient, so the namespaced names are what keep them apart.">pharmacy P-123 (2nd server)</button>
+      <button onclick="suggest('Look up the referral guidance on the public web — and note that I want to be seen within six weeks.')" title="F6 step 1. Two halves on purpose: the web lookup taints the run EXTERNAL, and the &quot;note that I want…&quot; clause gives mem0 a user-stated fact to extract. Ask for the lookup alone and no row is written, because mem0's default extractor takes facts from user messages only.">web lookup → stores a labelled row (F6)</button>
+      <button onclick="suggest('Check for interactions between metformin and lisinopril.')" title="F6 step 2. Run this AFTER the web-lookup chip. It calls no PHI tool, yet recalling the labelled row taints the run and the clinical lookup is denied — an action blocked by something read out of storage. Approve the row in the memory panel and this succeeds again.">clinical lookup → denied by a stored row (F6)</button>
     </div>
     <div id="input-row">
       <input id="input" placeholder="Type a message…" autofocus>
@@ -549,9 +633,32 @@ async function listMem(){
   if(d.skipped){ el.innerHTML='<span class="chip clean">memory not enabled</span>'; return; }
   if(d.ok===false){ el.innerHTML='<span class="chip phi">error: '+(d.error||'unknown')+'</span>'; return; }
   if(!d.memories || !d.memories.length){ el.innerHTML='<span class="chip clean">empty</span>'; return; }
-  el.innerHTML = d.memories.map(m=>
-    `<div class="gate"><span>${m.text}</span> <button class="demo-btn" onclick="delMem('${m.id}')">delete</button></div>`
-  ).join('');
+  // Labelled rows first: they are the ones a reviewer has to decide about.
+  const rows=[...d.memories].sort((a,b)=>(b.labels?1:0)-(a.labels?1:0));
+  el.innerHTML = rows.map(m=>{
+    const tainted = m.labels && m.labels.length;
+    const tag = tainted
+      ? `<span class="chip phi" title="derived from content read off the public web">&#9888; ${m.labels.join(', ')}</span> `
+      : (m.reviewed
+        ? `<span class="chip clean" title="cleared by ${m.reviewed.by} on ${m.reviewed.at}">&#10003; reviewed</span> `
+        : '');
+    // approve only where there is provenance to clear
+    const approve = tainted
+      ? ` <button class="demo-btn" onclick="approveMem('${m.id}')">approve</button>`
+      : '';
+    return `<div class="gate">${tag}<span>${m.text}</span>${approve} <button class="demo-btn" onclick="delMem('${m.id}')">delete</button></div>`;
+  }).join('');
+}
+
+async function approveMem(id){
+  // Spell out the consequence: clearing the label also stops this row tainting
+  // the runs that recall it, so the tool gate goes quiet for them.
+  if(!confirm('Mark this memory as reviewed? It will no longer be treated as untrusted, and will stop blocking gated tools on turns that recall it.')) return;
+  const r=await fetch('/memory/approve',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({memory_id:id,user_id:'u1'})});
+  const d=await r.json();
+  if(d.ok===false){ alert(d.error||d.reason||'approve failed'); }
+  listMem();
 }
 async function delMem(id){
   await fetch('/memory/delete',{method:'POST',headers:{'Content-Type':'application/json'},
