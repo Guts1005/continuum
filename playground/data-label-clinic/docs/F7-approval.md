@@ -102,20 +102,6 @@ python server.py            # :8911 — clinic MCP tools
 python pharmacy_server.py   # :8912 — pharmacy MCP tools, incl. check_interactions
 python web.py               # :8910 — the UI, with CLINIC_APPROVAL set
 ```
-
-Start `web.py` with the pharmacy server down and the page still loads — `GET /`
-returns 200 and the chat box works — but every message comes back as:
-
-```
-Agent unavailable. [MCP_CONNECTION_ERROR] Failed to connect to MCP server:
-Cancelled via cancel scope … | Context: server_name=pharmacy
-```
-
-which reads as a broken page rather than a missing terminal. `ToolExecutor`
-builds one registry over both servers, so one unreachable server fails the whole
-agent. The startup log lists what was discovered; if
-`pharmacy__check_interactions` is not in it, fix that before reading on.
-
 AP6 replaces the third terminal with `approval_temporal.py` but still needs the
 first two.
 
@@ -580,16 +566,26 @@ await h.query("get_pending_approvals")
   new one depends on the tool — transferring money and sending a reminder want
   opposite answers. `run_id` and `arguments` are on the request so an app can
   build the policy it needs; the SDK does not pick one, because half-built
-  idempotency looks like protection while quietly authorising repeats.
+  idempotency looks like protection while quietly authorising repeats. If you
+  want it remembered, do it in your app — see below.
 
-  **If you want it remembered, do it in your app, not in the SDK.** An approval
-  handler is just `async (request) -> decision`, so wrap yours in one that looks
-  up a store first and writes the answer back after. You choose the key — the
-  arguments, a business id, or nothing at all — because only you know whether
-  running your tool twice is safe. Two rules: never cache a `deferred` (nobody
-  answered yet), and delete a cached answer once it is used, so one approval
-  authorises one execution rather than becoming a standing permit.
-  `queue_approval_handler` in `approval_ui.py` is a working example.
+### If you want approvals remembered
+
+Do it in your app, not in the SDK. An approval handler is just
+`async (request) -> decision`, so wrap yours in one that looks up a store first
+and writes the answer back after.
+
+```python
+approval_handler = remembering(my_handler, key=..., store=redis)
+```
+
+You choose the key — the arguments, a business id, or nothing at all — because
+only you know whether running your tool twice is safe. Two rules: never cache a
+`deferred` (nobody answered yet), and delete a cached answer once it is used, so
+one approval authorises one execution rather than becoming a standing permit.
+`queue_approval_handler` in `approval_ui.py` is a working example.
+
+---
 
 ## Where each scenario hits the SDK
 
