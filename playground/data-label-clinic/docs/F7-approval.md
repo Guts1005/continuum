@@ -311,9 +311,35 @@ python approval_temporal.py
 ```
 
 It prints the prompt and stops — the turn is blocked inside the activity,
-heartbeating, holding no connection open. Answer it from the Temporal UI at
-[localhost:8233](http://localhost:8233), or from another shell using the
-`workflow` and `request_id` it printed:
+heartbeating, holding no connection open. Two ways to answer it.
+
+**From the Temporal UI** at [localhost:8233](http://localhost:8233). Open the
+workflow it printed, then **More Actions → Send a Signal**:
+
+| field | value |
+|---|---|
+| Signal name | `submit_approval` — pick it from the dropdown; the workflow advertises it, along with `request_tool_approval`, `inject_input` and `cancel_workflow` |
+| Data | the JSON below, with the `request_id` the driver printed |
+| Encoding | `json/plain` (the default) |
+
+```json
+{"request_id": "tool-1bf5610c6886", "decision": "approved", "decided_by": "tom"}
+```
+
+A plain JSON object is enough: the connection uses Temporal's pydantic data
+converter, so the payload is validated into `ApprovalDecision` on the way in.
+`decided_by` is what lands in the audit trail — put a real name there and you
+will see it come back as `decision: … approved by <name>`.
+
+> **Make the window tall enough first.** The dialog is longer than a short
+> browser window, and the UI's footer bar covers the Submit button when it is
+> below the fold — the click registers on nothing, the dialog stays open, and
+> no signal is sent. There is no error, and the workflow simply stays
+> `Running`. This cost four attempts to spot. If a submit seems to do nothing,
+> maximise the window and try again, then check **Event History** for a second
+> `WorkflowExecutionSignaled`.
+
+**Or from another shell**, using the `workflow` and `request_id` it printed:
 
 ```python
 import asyncio, os
@@ -348,6 +374,25 @@ answer:  There are no clinically significant interactions between metformin and
          lisinopril. They are commonly co-prescribed.
 decision: tool-475029b4b197 approved by tom
 ```
+
+Measured through the UI, same mechanism, a different reviewer name so the trail
+is unambiguous about which route answered it:
+
+```
+decision: tool-1bf5610c6886 approved by tom-via-ui
+```
+
+and in the workflow's Event History, the second signal is the answer:
+
+```
+ 6  17:44:19Z  WorkflowExecutionSignaled     ← request_tool_approval, from the activity
+10  17:49:17Z  WorkflowExecutionSignaled     ← submit_approval, from the UI
+19  17:49:21Z  WorkflowExecutionCompleted
+```
+
+Five minutes blocked, then four seconds to finish once answered. That gap is the
+claim: nothing was recomputed, and `decided_by` typed into a browser form came
+back through `ApprovalDecision` untouched.
 
 While it is blocked you can read the request off the workflow yourself — this is
 what a reviewer's UI calls:
