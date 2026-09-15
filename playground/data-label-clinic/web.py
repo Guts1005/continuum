@@ -656,8 +656,17 @@ function renderApproval(p){
     ? ' <span class="chip phi">'+p.data_labels.join(', ')+'</span>' : '';
   el.innerHTML='<b>&#9208; APPROVAL NEEDED</b>'+labels+'<br><code>'+p.tool_name+'</code>'
     +'<pre style="margin:6px 0;white-space:pre-wrap">'+JSON.stringify(p.arguments,null,1)+'</pre>'
-    +'<button class="demo-btn" onclick="decideApproval(\''+p.request_id+'\',true,this)">approve</button> '
-    +'<button class="demo-btn" onclick="decideApproval(\''+p.request_id+'\',false,this)">deny</button>';
+    +'<button class="demo-btn" data-ok="1">approve</button> '
+    +'<button class="demo-btn" data-ok="0">deny</button>';
+  // Handlers attached rather than written into an onclick attribute. Building
+  // one needs a quoted argument, and a Python-escaped quote renders as a bare
+  // quote that closes the JS string early -- which broke this whole script
+  // block once already. No quotes to escape, no way to reintroduce it.
+  el.querySelectorAll('button').forEach(function(b){
+    b.addEventListener('click', function(){
+      decideApproval(p.request_id, b.dataset.ok === '1', b);
+    });
+  });
 }
 
 async function decideApproval(id, approved, btn){

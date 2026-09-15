@@ -1270,3 +1270,70 @@ class TestQueueMode:
 
         src = inspect.getsource(clinic_agent)
         assert "APPROVAL PENDING" in src
+
+
+class TestThePageScriptParses:
+    """The clinic's inline JavaScript must parse, checked on the RENDERED page.
+
+    A syntax error anywhere in a <script> block kills the whole block, so every
+    function in it is undefined: the Send button does nothing, the glassbox
+    panel never populates, and the page looks like a backend failure while the
+    backend is answering perfectly.
+
+    Checked against ``web.HTML_PAGE`` -- the string a browser receives -- and not
+    against web.py's source, because that distinction is the bug this exists to
+    catch. The approval prompt was written with ``\\'`` inside a Python string:
+    valid in the source, and rendered as a bare ``'`` that terminates the JS
+    string. Extracting the script from web.py's SOURCE parsed fine and the page
+    was broken, which is exactly what happened.
+
+    The shop grew this guard after the same class of bug (a ``\\n`` inside a
+    single-quoted JS string). The clinic never did, so this one shipped.
+    """
+
+    def test_the_rendered_page_script_is_valid_javascript(self):
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not available to parse the page script")
+
+        import web
+
+        blocks = re.findall(r"<script>(.*?)</script>", web.HTML_PAGE, re.S)
+        assert blocks, "no inline script found — the extraction is looking in the wrong place"
+
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write("\n".join(blocks))
+            path = fh.name
+        result = subprocess.run([node, "--check", path], capture_output=True, text=True)
+        assert result.returncode == 0, (
+            f"the page's inline JavaScript does not parse, so nothing on the page "
+            f"works:\n{result.stderr}"
+        )
+
+    def test_no_escaped_quotes_survive_into_the_rendered_script(self):
+        """The specific shape that broke it, kept as a named guard.
+
+        A `\\'` in the Python source renders as a bare `'`. Inside a
+        single-quoted JS string being concatenated, that closes the string early
+        and the parse error is several lines further on, where it is hard to
+        read back to the cause.
+        """
+        import re
+
+        import web
+
+        blocks = "\n".join(re.findall(r"<script>(.*?)</script>", web.HTML_PAGE, re.S))
+        offenders = [
+            ln.strip()
+            for ln in blocks.splitlines()
+            if re.search(r"onclick=\"[^\"]*''", ln)
+        ]
+        assert not offenders, (
+            "an onclick argument rendered as an empty string pair — a Python-escaped "
+            f"quote leaked through: {offenders[:2]}"
+        )
