@@ -91,9 +91,39 @@ a rule deciding versus a human deciding.
 
 ---
 
+## Before any of these — three terminals
+
+The gated tool is `check_interactions`, which lives on the **pharmacy** server.
+Both servers must be up before `web.py`, and not just so the tool exists — the
+agent refuses to initialise without them.
+
+```bash
+python server.py            # :8911 — clinic MCP tools
+python pharmacy_server.py   # :8912 — pharmacy MCP tools, incl. check_interactions
+python web.py               # :8910 — the UI, with CLINIC_APPROVAL set
+```
+
+Start `web.py` with the pharmacy server down and the page still loads — `GET /`
+returns 200 and the chat box works — but every message comes back as:
+
+```
+Agent unavailable. [MCP_CONNECTION_ERROR] Failed to connect to MCP server:
+Cancelled via cancel scope … | Context: server_name=pharmacy
+```
+
+which reads as a broken page rather than a missing terminal. `ToolExecutor`
+builds one registry over both servers, so one unreachable server fails the whole
+agent. The startup log lists what was discovered; if
+`pharmacy__check_interactions` is not in it, fix that before reading on.
+
+AP6 replaces the third terminal with `approval_temporal.py` but still needs the
+first two.
+
+---
+
 ## AP1 — a declared tool asks, and proceeds when approved
 
-1. Start `web.py` with `CLINIC_APPROVAL=auto`.
+1. Start `web.py` with `CLINIC_APPROVAL=auto`, both MCP servers already up.
 2. Send **"Check for interactions between metformin and lisinopril."**
 
 ```
