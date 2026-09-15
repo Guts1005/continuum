@@ -245,10 +245,53 @@ whatever came before the gate. The durable route is the third shape: the turn
 **blocks in place** and resumes when answered.
 
 It needs a Temporal workflow, which `web.py` does not run — so this mode is
-driven by `approval_temporal.py` rather than the browser. Everything else is the
-clinic's own agent, MCP servers and policy store, so the call being gated is the
-same one AP1–AP5 gate. The handler is the SDK's `temporal_tool_approval()`,
-which finds its own workflow at call time.
+driven by `approval_temporal.py` rather than the browser, and the reviewer
+answers in Temporal's own UI. Everything else is the clinic's own agent, MCP
+servers and policy store, so the call being gated is the same one AP1–AP5 gate.
+The handler is the SDK's `temporal_tool_approval()`, which finds its own
+workflow at call time.
+
+### Why this one leaves the clinic's UI
+
+`web.py` runs the agent in-process — `POST /chat` calls `_agent.chat()`, which
+calls `runner.run()`. There is no workflow anywhere in that path, and
+`temporal_tool_approval()` resolves its workflow from `activity.info()`, so
+inside an HTTP handler it finds no activity and defers every request rather than
+letting the call through unreviewed. Something has to start a workflow and run a
+worker; that something is the driver.
+
+This is a choice, not a limit. The clinic already *has* a browser approval UI —
+`CLINIC_APPROVAL=ask`, AP1–AP4, with Approve and Deny buttons in the chat. What
+it cannot do is survive, because the turn is held inside an open HTTP request.
+AP6's claim is not a nicer reviewer view; it is **where the wait lives**:
+
+| mode | reviewer sees | the wait is held in |
+|---|---|---|
+| `ask` | the clinic chat, in-line | an open HTTP request — browser and proxy limits apply |
+| `queue` | the clinic chat, out of band | nothing at all; the turn already ended |
+| `temporal` | Temporal UI at :8233 | durable workflow state |
+
+Wiring the clinic's own UI to the workflow is perfectly possible, and the cost
+is worth naming because it is not where you would guess. The approval endpoints
+are trivial to repoint: `/approval/pending` becomes a
+`handle.query("get_pending_approvals")` and `/approval/decide` a
+`handle.signal("submit_approval", …)`, a few dozen lines including tracking a
+workflow id per conversation. The prompt card in the page already exists.
+
+The expense is `/chat`. `ClinicAgent.chat()` returns `response`, `taint`,
+`model_used`, `gate_events` and `tools_called` — those last four *are* the
+glassbox panels on the right of the page, and they are the reason this
+playground exists. Route the turn through Temporal and `run_agent_activity`
+hands back an `AgentActivityResult`: `content`, `status`, `usage`,
+`agents_used`. No taint, no gate events, no tool list. Every panel goes blank
+unless you either change an SDK type on the shared Temporal path or carry the
+glassbox data through `metadata` as a second result shape. Streaming goes too —
+a workflow returns a result, it does not yield tokens, so the page's `stream`
+checkbox would need its own channel.
+
+So the demo borrows Temporal's UI instead. Not because the clinic's UI could not
+show a durable approval, but because making it do so would cost the clinic the
+thing it is actually demonstrating.
 
 10. Start Temporal and both MCP servers:
 
