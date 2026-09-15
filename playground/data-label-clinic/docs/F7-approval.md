@@ -233,27 +233,119 @@ reply: There are no clinically significant interactions between metformin and
   **one** execution and is then forgotten; asking a third time queues again. A
   standing permit would be exactly the hazard the SDK declines to build in.
 
+## AP6 — a reviewer who answers in an hour (Temporal)
+
+`ask` holds an HTTP request open, so the reviewer has to be watching. `queue`
+lets them answer whenever, but the turn ends and the user asks again, redoing
+whatever came before the gate. The durable route is the third shape: the turn
+**blocks in place** and resumes when answered.
+
+This one is not a `CLINIC_APPROVAL` mode — it needs a Temporal workflow, which
+the clinic does not run. The handler is `temporal_tool_approval()`:
+
+```python
+from continuum.temporal import temporal_tool_approval
+
+AgentConfig(
+    tool_approval={"*transfer_funds"},
+    approval_handler=temporal_tool_approval(),   # finds its own workflow
+    approval_timeout=90.0,
+)
+```
+
+10. Start the stack, then run an agent inside a workflow:
+
+```bash
+# from the repo root. temporal-ui sits behind the `full` profile, so naming it
+# explicitly is what starts it; the UI then serves on 8233, not its container's 8080.
+docker compose up -d temporal postgres-temporal temporal-ui
+```
+
+11. The turn blocks at the gate and the request appears on the workflow. Answer
+    it with the same `submit_approval` signal a planned approval step uses —
+    from the Temporal UI at [localhost:8233](http://localhost:8233), from
+    `HumanInLoopManager`, or directly:
+
+```python
+await handle.signal("submit_approval", ApprovalDecision(
+    request_id=pending[0]["request_id"], decision="approved", decided_by="tom"))
+```
+
+Measured against Temporal 1.29.3 with a real worker:
+
+```
+workflow: f7-385f3fd3
+PROMPT:   bank__transfer_funds {"amount": 5000000}
+APPROVED by tom
+status:   completed
+tool actually ran with: [5000000]
+```
+
+and the refusal, same setup:
+
+```
+REJECTED by tom
+tool actually ran with: []
+```
+
+- **What it proves:** the turn resumed **in place**. The work before the gate was
+  not repeated and nobody had to ask again — the one thing this adds over AP5.
+  The prompt carried the arguments, as everywhere else.
+- **One signal, one reviewer.** `submit_approval` serves both a planned approval
+  step and an ad-hoc tool approval, with the same allow-list check via
+  `is_authorized`. A tool approval is not a second, weaker door into the same
+  workflow.
+- **Every failure defers, never denies.** An unreachable workflow, a query that
+  fails mid-wait, or a `request_id` the workflow does not recognise all return
+  *deferred*. Temporal being down is not a reviewer saying no, and `unknown` is
+  a distinct status from `pending` precisely so silence cannot be read as
+  permission.
+
+> **The gotcha that cost four attempts.** `temporal_tool_approval()` resolves
+> its handle through the **global** Temporal client, and a worker connects its
+> **own** — they are different objects. So a setup that looks entirely correct,
+> with a connected worker happily running activities, defers every approval with
+> *"Not connected to Temporal server"*. It fails safe, which is the good half,
+> but it reads as a network fault rather than a missing line:
+>
+> ```python
+> await get_temporal_client().connect(host)
+> ```
+>
+> The deferral message now names this, because it is the only part an operator
+> sees.
+
 ---
 
 ## What this layer does and doesn't cover
 
 - **Covers:** the gate firing on a declared tool, an approval proceeding, a
   refusal relayed as a tool result, a real prompt carrying the arguments,
-  failing closed on a timeout, and the refuse-and-resume round trip — live, with
-  the ungated `off` mode as the control for each.
+  failing closed on a timeout, the refuse-and-resume round trip, and a durable
+  wait through Temporal — live, with the ungated `off` mode as the control for
+  each.
 
-- **Doesn't cover: a durable, hours-long wait.** This is the honest limit, and
-  it is structural rather than missing glue. `HumanInLoopManager` is the
-  decision-*submission* side — `approve`, `reject`, `submit_decision` — the API
-  a reviewer's UI calls. The waiting lives inside the Temporal workflow, whose
-  `_run_approval_step` appends to `_pending_approvals` and blocks on a signal;
-  nothing outside the workflow can register a request. And an approval handler
-  runs wherever the tool call runs, which under Temporal is inside an
-  **activity**, where workflow APIs are unavailable by design.
-  Wiring the two together needs workflow-side support that does not exist: a
-  signal to register an ad-hoc approval, and a query to read its decision.
-  `TestTheTemporalRouteIsNotAvailableYet` asserts both halves of that constraint
-  so it is a tested fact rather than a note.
+- **Covers an hours-long wait, through Temporal** — see AP6. This paragraph
+  used to say the opposite, and the history is worth keeping because it explains
+  the shape. `HumanInLoopManager` is the decision-*submission* side — `approve`,
+  `reject`, `submit_decision` — the API a reviewer's UI calls. The waiting lived
+  inside the workflow, whose `_run_approval_step` appends to
+  `_pending_approvals` and blocks on a signal, and nothing outside could
+  register a request. An approval handler runs wherever the tool call runs,
+  which under Temporal is inside an **activity**, where workflow APIs are
+  unavailable by design. Those two facts together made the route impossible, and
+  a test asserted them.
+  That test failed the moment `request_tool_approval` (a signal) and
+  `get_approval_decision` (a query) were added, which is what a tripwire is for.
+
+- **Doesn't cover: surviving a worker restart.** The remaining limit, and a real
+  one. The whole agent turn is ONE activity — `run_agent_activity` calls
+  `runner.run()` — so the workflow cannot pause *between* the agent's own steps.
+  The activity blocks in place, which is why work done before the gate is not
+  repeated and nobody has to ask again; but a retried activity starts from the
+  beginning. A reviewer at lunch is fine. A reviewer who outlasts a deploy is
+  not, and for them `CLINIC_APPROVAL=queue` (AP5) is the honest answer, because
+  it holds nothing open at all.
 
 - **Approvals are serialised, not batched.** Tool calls run through
   `asyncio.gather`, so without a lock two handlers fire at once — two prompts
@@ -280,4 +372,5 @@ reply: There are no clinically significant interactions between metformin and
 | AP3 | `ToolApprovalRequest` carrying `arguments` and `data_labels`; `request_approval` serialising on a per-event-loop lock |
 | AP4 | `request_approval`'s fail-closed paths — timeout, raise, wrong return type, and no handler wired |
 | AP5 | `ToolApprovalDecision(deferred=True)` → `APPROVAL PENDING` rather than `APPROVAL DENIED`; the resume store is the app's (`approval_ui.py`) |
+| AP6 | `temporal_tool_approval` resolving its own handle from `activity.info()`; the workflow's `request_tool_approval` signal and `get_approval_decision` query; `submit_approval` shared with the planned step |
 | all | `build_approval_settings` reading `AgentConfig`, passed at both `ToolService` call sites |
