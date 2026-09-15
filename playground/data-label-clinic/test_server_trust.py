@@ -1036,6 +1036,45 @@ class TestApprovalModes:
         cfg = self._build(monkeypatch, "wat")
         assert cfg.build_approval_tools() == set()
 
+    def test_temporal_declares_the_gated_tool(self, monkeypatch):
+        """AP6. The durable route is a mode like the others, so the guide can
+        give one command instead of a code snippet the reader has to assemble."""
+        cfg = self._build(monkeypatch, "temporal")
+        assert cfg.APPROVAL_TOOL in cfg.build_approval_tools()
+        assert cfg.build_approval_handler() is not None
+
+    def test_temporal_wires_the_self_resolving_handler(self, monkeypatch):
+        """Not a clinic handler: the SDK's, which finds its own workflow from
+        activity.info(). Wiring a local one here would make AP6 prove nothing
+        about the durable route."""
+        cfg = self._build(monkeypatch, "temporal")
+        handler = cfg.build_approval_handler()
+        assert handler.__module__.startswith("continuum.temporal"), (
+            f"expected the SDK's temporal handler, got {handler.__module__}"
+        )
+
+    async def test_temporal_outside_a_workflow_defers_rather_than_approving(self, monkeypatch):
+        """Running this mode in `python web.py` reaches no workflow. It must not
+        approve -- that would let the call through unreviewed by the very
+        configuration that asked for review."""
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._build(monkeypatch, "temporal")
+        decision = await cfg.build_approval_handler()(
+            ToolApprovalRequest(tool_name=cfg.APPROVAL_TOOL, arguments={}, agent_name="clinic")
+        )
+        assert not decision.approved
+        assert decision.deferred
+
+    def test_the_temporal_timeout_is_not_the_http_one(self, monkeypatch):
+        """The whole point of AP6 is a reviewer who is not watching, so the
+        30s default that keeps `ask` inside proxy limits is wrong here."""
+        cfg = self._build(monkeypatch, "temporal")
+        assert cfg.approval_timeout() >= 300, (
+            "temporal mode still uses the HTTP-safe timeout, so a reviewer who "
+            "takes a minute gets denied — which is the case AP6 exists for"
+        )
+
     def test_the_timeout_is_switchable_and_defaults_http_safe(self, monkeypatch):
         """A blocked run holds the HTTP request open, so the default has to sit
         inside ordinary proxy limits rather than match how long a reviewer takes.

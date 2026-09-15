@@ -61,9 +61,13 @@ detector) and `pre_store_filter` (no content classifier).
 | `deny` | refuses programmatically. Shows what the model is told, without waiting for a person |
 | `ask` | a real prompt in the web UI, blocking the turn while a reviewer answers |
 | `queue` | refuse and resume — the turn ends at once saying *pending*, someone answers out of band, a later turn proceeds |
+| `temporal` | the durable route — the turn **blocks in place** inside a Temporal activity and resumes when answered. Driven by `approval_temporal.py`, not `web.py` |
 
-`CLINIC_APPROVAL_TIMEOUT` (default 30) is how long the gate waits. It is
-switchable because the limit **is** the demo — see AP4.
+`CLINIC_APPROVAL_TIMEOUT` (default 30, or **600** under `temporal`) is how long
+the gate waits. It is switchable because the limit **is** the demo — see AP4.
+The default differs because the reason for 30 does not apply to `temporal`:
+nothing holds an HTTP request open there, so 30 would deny a reviewer who took
+half a minute — the case AP6 exists for.
 
 ### Why `check_interactions` and not `send_referral_email`
 
@@ -240,52 +244,119 @@ lets them answer whenever, but the turn ends and the user asks again, redoing
 whatever came before the gate. The durable route is the third shape: the turn
 **blocks in place** and resumes when answered.
 
-This one is not a `CLINIC_APPROVAL` mode — it needs a Temporal workflow, which
-the clinic does not run. The handler is `temporal_tool_approval()`:
+It needs a Temporal workflow, which `web.py` does not run — so this mode is
+driven by `approval_temporal.py` rather than the browser. Everything else is the
+clinic's own agent, MCP servers and policy store, so the call being gated is the
+same one AP1–AP5 gate. The handler is the SDK's `temporal_tool_approval()`,
+which finds its own workflow at call time.
 
-```python
-from continuum.temporal import temporal_tool_approval
-
-AgentConfig(
-    tool_approval={"*transfer_funds"},
-    approval_handler=temporal_tool_approval(),   # finds its own workflow
-    approval_timeout=90.0,
-)
-```
-
-10. Start the stack, then run an agent inside a workflow:
+10. Start Temporal and both MCP servers:
 
 ```bash
 # from the repo root. temporal-ui sits behind the `full` profile, so naming it
 # explicitly is what starts it; the UI then serves on 8233, not its container's 8080.
 docker compose up -d temporal postgres-temporal temporal-ui
+
+# from playground/data-label-clinic, one per terminal
+python server.py
+python pharmacy_server.py
 ```
 
-11. The turn blocks at the gate and the request appears on the workflow. Answer
-    it with the same `submit_approval` signal a planned approval step uses —
-    from the Temporal UI at [localhost:8233](http://localhost:8233), from
-    `HumanInLoopManager`, or directly:
+11. Run both scripted paths. No browser, no reviewer — these prove the round
+    trip works before you try answering one by hand:
 
-```python
-await handle.signal("submit_approval", ApprovalDecision(
-    request_id=pending[0]["request_id"], decision="approved", decided_by="tom"))
+```bash
+python approval_temporal.py --auto approve
+python approval_temporal.py --auto deny
 ```
 
-Measured against Temporal 1.29.3 with a real worker:
+Measured, against Temporal 1.29.3 with a real worker and a real LLM call:
 
 ```
-workflow: f7-385f3fd3
-PROMPT:   bank__transfer_funds {"amount": 5000000}
+connected to temporal at localhost:7233
+gated tool: pharmacy__check_interactions
+worker up on clinic-f7-approval
+workflow: f7-04301c39
+
+PROMPT
+  request_id: tool-04301c39ee7c
+  tool:       pharmacy__check_interactions
+  arguments:  {"medications": ["metformin", "lisinopril"]}
+
 APPROVED by tom
-status:   completed
-tool actually ran with: [5000000]
+
+status:  completed
+answer:  There are no clinically significant interactions between metformin and
+         lisinopril. They are commonly co-prescribed.
+decision: tool-04301c39ee7c approved by tom
 ```
 
 and the refusal, same setup:
 
 ```
 REJECTED by tom
-tool actually ran with: []
+
+status:  completed
+answer:  The action to check for interactions between metformin and lisinopril
+         was not approved and therefore was not performed. It requires approval
+         to proceed.
+decision: tool-3e8d15260cd8 rejected by tom
+```
+
+12. Now answer one **yourself**, which is the actual scenario. Run it with no
+    `--auto`:
+
+```bash
+python approval_temporal.py
+```
+
+It prints the prompt and stops — the turn is blocked inside the activity,
+heartbeating, holding no connection open. Answer it from the Temporal UI at
+[localhost:8233](http://localhost:8233), or from another shell using the
+`workflow` and `request_id` it printed:
+
+```python
+import asyncio, os
+os.environ.setdefault("CLINIC_APPROVAL", "temporal")
+from continuum.temporal import get_temporal_client
+from continuum.temporal.types import ApprovalDecision
+
+async def main():
+    c = get_temporal_client()
+    await c.connect("localhost:7233")
+    h = c.raw_client.get_workflow_handle("f7-d281aa19")      # the printed workflow
+    await h.signal("submit_approval", ApprovalDecision(
+        request_id="tool-475029b4b197",                      # the printed request_id
+        decision="approved", decided_by="tom"))
+
+asyncio.run(main())
+```
+
+Measured: the run blocked at 13:20:53, sat there while the reviewer did
+something else, and on the signal resumed and completed — **one** workflow,
+**one** LLM call, no second ask. That gap was about four minutes, comfortably
+past the 30s `ask` is stuck with.
+
+```
+PROMPT
+  request_id: tool-475029b4b197
+  arguments:  {"medications": ["metformin", "lisinopril"]}
+waiting for a reviewer. Answer it with submit_approval —
+
+status:  completed
+answer:  There are no clinically significant interactions between metformin and
+         lisinopril. They are commonly co-prescribed.
+decision: tool-475029b4b197 approved by tom
+```
+
+While it is blocked you can read the request off the workflow yourself — this is
+what a reviewer's UI calls:
+
+```python
+await h.query("get_pending_approvals")
+# [{'request_id': 'tool-475029b4b197', 'workflow_id': 'f7-d281aa19',
+#   'description': 'pharmacy__check_interactions',
+#   'context': '{"medications": ["metformin", "lisinopril"]}', 'approvers': []}]
 ```
 
 - **What it proves:** the turn resumed **in place**. The work before the gate was
@@ -313,7 +384,21 @@ tool actually ran with: []
 > ```
 >
 > The deferral message now names this, because it is the only part an operator
-> sees.
+> sees. `approval_temporal.py` makes the call, so you only hit this writing your
+> own driver.
+
+> **A second one, if you write your own driver.** Do not call
+> `worker.register_workflow(AgentWorkflow)` or
+> `worker.register_activity(run_agent_activity)`. `WorkerManager.start` already
+> registers both, and registering them again is a hard failure at worker
+> startup — `ValueError: More than one activity named run_agent_activity` —
+> not a duplicate that gets ignored.
+
+> **And print with line buffering.** The one output you are waiting for is
+> produced *while the turn is blocked*. Pipe a driver's stdout anywhere and
+> Python block-buffers it, so a correctly blocked run looks exactly like a hung
+> one. `approval_temporal.py` calls `sys.stdout.reconfigure(line_buffering=True)`
+> for this reason.
 
 ---
 

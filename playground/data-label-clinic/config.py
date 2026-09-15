@@ -386,16 +386,22 @@ def approval_timeout() -> float:
     request open, so this has to stay inside browser and proxy limits rather
     than match how long a reviewer actually takes. Set it to 3 and walk away to
     watch it fail closed.
+
+    `temporal` defaults to 600 instead of 30. Nothing is holding an HTTP request
+    open there -- the activity blocks and heartbeats -- so the constraint that
+    sets 30 does not apply, and 30 would deny a reviewer who took half a minute,
+    which is exactly the case AP6 exists for.
     """
+    default = "600" if os.environ.get("CLINIC_APPROVAL") == "temporal" else "30"
     try:
-        return float(os.environ.get("CLINIC_APPROVAL_TIMEOUT", "30"))
+        return float(os.environ.get("CLINIC_APPROVAL_TIMEOUT", default))
     except ValueError:
-        return 30.0
+        return float(default)
 
 
 def build_approval_tools() -> set[str]:
     """Which tools need a person. Empty unless CLINIC_APPROVAL asks for one."""
-    if os.environ.get("CLINIC_APPROVAL", "off") in ("auto", "deny", "ask", "queue"):
+    if os.environ.get("CLINIC_APPROVAL", "off") in ("auto", "deny", "ask", "queue", "temporal"):
         return {APPROVAL_TOOL}
     return set()
 
@@ -416,6 +422,10 @@ def build_approval_handler():
         telling the user it is pending, somebody answers out of band, and the
         next turn asking the same thing proceeds. The shape for a reviewer who
         is not sitting there, and the one that does not hold a connection open.
+    temporal -- the durable route. The turn BLOCKS IN PLACE inside a Temporal
+        activity and resumes when answered, so work done before the gate is not
+        repeated and nobody has to ask again. Needs a workflow, so it is driven
+        by `python approval_temporal.py`, not by web.py.
     """
     mode = os.environ.get("CLINIC_APPROVAL", "off")
     if mode == "auto":
@@ -430,6 +440,15 @@ def build_approval_handler():
         from approval_ui import queue_approval_handler
 
         return queue_approval_handler
+    if mode == "temporal":
+        # The SDK's handler, not a clinic one. It resolves its own workflow at
+        # call time -- the id from activity.info(), the handle from the GLOBAL
+        # Temporal client -- because an agent is built long before any workflow
+        # exists. Run by approval_temporal.py; under `python web.py` there is no
+        # activity, so every request defers rather than proceeding unreviewed.
+        from continuum.temporal import temporal_tool_approval
+
+        return temporal_tool_approval()
     return None
 
 
