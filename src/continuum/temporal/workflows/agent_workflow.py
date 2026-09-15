@@ -85,7 +85,7 @@ class AgentWorkflow:
     # ------------------------------------------------------------------
 
     @workflow.signal
-    async def submit_approval(self, decision: ApprovalDecision) -> None:
+    async def submit_approval(self, decision: ApprovalDecision | None = None) -> None:
         """Human submits approval/rejection.
 
         Serves both approval paths. A decision whose ``request_id`` names an
@@ -93,7 +93,31 @@ class AgentWorkflow:
         resolved here and never reaches ``_pending_decision``; anything else is
         left for ``_run_approval_step``, which is waiting on exactly that. One
         signal, one reviewer UI, two kinds of thing being approved.
+
+        ``decision`` is optional ONLY so an unusable payload can be dropped
+        instead of raising. A signal handler that raises fails the workflow
+        ACTIVATION, and Temporal retries an activation forever -- so one empty
+        Send-a-Signal form, from anyone who can reach the UI, parks the run
+        permanently and the reviewer's real answer can never land afterwards.
+        Found live, as::
+
+            TypeError: AgentWorkflow.submit_approval() missing 1 required
+            positional argument: 'decision'
+
+        Nothing else is softened. A decision that deserializes but names an
+        unknown request still falls through to ``_pending_decision``, and an
+        unauthorized one is still refused and leaves the prompt open.
         """
+        if not isinstance(decision, ApprovalDecision):
+            # Module logger, not workflow.logger: see _resolve_tool_approval.
+            _logger.warning(
+                "Ignoring a submit_approval signal carrying %s instead of an "
+                "ApprovalDecision. The Data field was probably empty — send "
+                '{"request_id": ..., "decision": "approved"|"rejected", '
+                '"decided_by": ...}. Any pending approval is still answerable.',
+                type(decision).__name__,
+            )
+            return
         if self._resolve_tool_approval(decision):
             return
         self._pending_decision = decision

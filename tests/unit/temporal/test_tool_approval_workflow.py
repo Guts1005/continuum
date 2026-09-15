@@ -182,6 +182,71 @@ class TestTheAnswerIsValidated:
         assert wf._pending_decision.request_id == "planned-step-1"
 
 
+class TestAMalformedSignalCannotWedgeTheWorkflow:
+    """Found live, from the Temporal UI.
+
+    A signal handler that raises does not just lose that signal -- it fails the
+    workflow ACTIVATION, and Temporal retries an activation forever. So one
+    empty Send-a-Signal form, from anyone who can reach the UI, parks the
+    workflow permanently: the reviewer's real answer can never land afterwards
+    because the activation never completes.
+
+        TypeError: AgentWorkflow.submit_approval() missing 1 required
+        positional argument: 'decision'
+
+    A reviewer sending a bad payload is a mistake to ignore loudly, not a reason
+    to take the run down. Note what is NOT softened: a decision that deserializes
+    fine but names an unknown request still falls through to _pending_decision,
+    and an unauthorized one is still refused. Only the unusable payload is
+    dropped.
+    """
+
+    async def test_a_signal_with_no_payload_is_ignored_not_raised(self):
+        wf = _workflow()
+        await wf.request_tool_approval({"request_id": "tool-1", "description": "t"})
+
+        await wf.submit_approval()  # the empty Data field, verbatim
+
+        assert wf.get_approval_decision("tool-1") == {"status": "pending"}, (
+            "the prompt must stay answerable after a junk signal"
+        )
+
+    async def test_a_null_payload_is_ignored(self):
+        wf = _workflow()
+        await wf.submit_approval(None)
+        assert wf._pending_decision is None
+
+    async def test_a_payload_missing_fields_is_ignored(self):
+        """Belt and braces: the pydantic converter rejects most of these before
+        the handler sees them, but the handler must not assume that."""
+        wf = _workflow()
+        await wf.submit_approval({"decided_by": "tom"})  # type: ignore[arg-type]
+        assert wf._pending_decision is None
+
+    async def test_a_real_decision_still_lands_after_a_junk_one(self):
+        """The property that actually matters: the run is still answerable."""
+        wf = _workflow()
+        await wf.request_tool_approval(
+            {"request_id": "tool-1", "description": "t", "approvers": ["alice"]}
+        )
+        await wf.submit_approval()
+        await wf.submit_approval(_decision("tool-1", "approved", "alice"))
+
+        assert wf.get_approval_decision("tool-1")["status"] == "approved"
+
+    async def test_a_wrong_request_id_is_still_forwarded_not_swallowed(self):
+        """The mistake a reviewer actually makes is pasting the WORKFLOW id
+        where the tool request id goes. That deserializes fine, so it must keep
+        its existing behaviour -- fall through to the planned approval step --
+        rather than being caught by the new guard."""
+        wf = _workflow()
+        await wf.request_tool_approval({"request_id": "tool-1", "description": "t"})
+        await wf.submit_approval(_decision("f7-10acdb7f", "approved", "tom"))
+
+        assert wf._pending_decision is not None
+        assert wf.get_approval_decision("tool-1") == {"status": "pending"}
+
+
 class TestTheDecisionRecordIsKept:
     async def test_decisions_are_recorded_for_the_workflow_result(self):
         """approval_decisions is part of WorkflowResult: what was approved, by

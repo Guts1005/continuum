@@ -329,7 +329,16 @@ workflow it printed, then **More Actions → Send a Signal**:
 A plain JSON object is enough: the connection uses Temporal's pydantic data
 converter, so the payload is validated into `ApprovalDecision` on the way in.
 `decided_by` is what lands in the audit trail — put a real name there and you
-will see it come back as `decision: … approved by <name>`.
+will see it come back as `decision: … approved by <name>`. For a refusal, change
+`"decision"` to `"rejected"`; an optional `"reason"` is relayed to the model.
+
+> **`request_id` is the `tool-…` id, not the workflow id.** They sit next to
+> each other on that page and the workflow id is the one in the heading, so it
+> is the easy thing to paste. A workflow id there is not an error — it
+> deserializes perfectly well and is simply a decision for a request that does
+> not exist, so the signal is accepted, nothing resolves, and the run stays
+> blocked with no complaint. Copy the `request_id:` line from the driver's
+> output.
 
 > **Make the window tall enough first.** The dialog is longer than a short
 > browser window, and the UI's footer bar covers the Submit button when it is
@@ -338,6 +347,13 @@ will see it come back as `decision: … approved by <name>`.
 > `Running`. This cost four attempts to spot. If a submit seems to do nothing,
 > maximise the window and try again, then check **Event History** for a second
 > `WorkflowExecutionSignaled`.
+
+> **Submitting an empty Data field used to park the workflow.** The signal
+> arrived with no payload, `submit_approval` raised `TypeError`, and a signal
+> handler that raises fails the workflow *activation* — which Temporal retries
+> forever. The run could then never be answered, including by a correct signal
+> sent afterwards. It is now dropped with a warning naming the cause, so a
+> mistyped form costs you one log line rather than the run.
 
 **Or from another shell**, using the `workflow` and `request_id` it printed:
 
