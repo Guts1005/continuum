@@ -582,6 +582,15 @@ await h.query("get_pending_approvals")
   build the policy it needs; the SDK does not pick one, because half-built
   idempotency looks like protection while quietly authorising repeats.
 
+  **If you want it remembered, do it in your app, not in the SDK.** An approval
+  handler is just `async (request) -> decision`, so wrap yours in one that looks
+  up a store first and writes the answer back after. You choose the key — the
+  arguments, a business id, or nothing at all — because only you know whether
+  running your tool twice is safe. Two rules: never cache a `deferred` (nobody
+  answered yet), and delete a cached answer once it is used, so one approval
+  authorises one execution rather than becoming a standing permit.
+  `queue_approval_handler` in `approval_ui.py` is a working example.
+
 ## Where each scenario hits the SDK
 
 | Scenario | SDK code path exercised |
