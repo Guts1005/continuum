@@ -259,6 +259,25 @@ class MemoryClient:
                 )
         return labels
 
+    def _provider_supports_gate(self) -> bool:
+        """Does the provider accept ``pre_store_filter``?
+
+        Checked by signature rather than by catching TypeError: a provider whose
+        own body raises TypeError for an unrelated reason would otherwise look
+        like an old provider and be silently retried without the gate.
+        """
+        import inspect
+
+        try:
+            params = inspect.signature(self._provider.add).parameters
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            return False
+        # An explicit parameter only. A provider with **kwargs would ACCEPT the
+        # argument and silently drop it -- no error, no gate, and no warning
+        # either, which is worse than the TypeError this check exists to avoid.
+        # Naming the parameter is how a provider says it will act on one.
+        return "pre_store_filter" in params
+
     def _ensure_enabled(self) -> None:
         """Raise error if memory is not enabled."""
         if not self.is_enabled:
@@ -344,6 +363,7 @@ class MemoryClient:
         policy_store: "PolicyStore | None" = None,
         subject: str | None = None,
         data_labels: set[str] | None = None,
+        pre_store_filter: Any | None = None,
     ) -> MemoryAddResult:
         """
         Add memories from messages or text.
@@ -417,8 +437,30 @@ class MemoryClient:
                 PROVENANCE_LABELS_KEY: sorted(eff_labels),
             }
 
+        # BaseMemoryProvider is a public interface, and a provider written
+        # before the gate existed does not accept this parameter -- passing it
+        # would raise TypeError and break memory entirely for an integration
+        # that was working. Degrade instead, and say so: without the gate the
+        # filter reverts to delete-after-write, which is weaker and racy, so an
+        # operator who configured a filter needs to know which one they have.
+        provider_kwargs: dict[str, Any] = {}
+        if pre_store_filter is not None:
+            if self._provider_supports_gate():
+                provider_kwargs["pre_store_filter"] = pre_store_filter
+            elif not getattr(self, "_warned_no_gate", False):
+                self._warned_no_gate = True
+                logger.warning(
+                    "%s does not accept pre_store_filter, so rejected facts are deleted "
+                    "AFTER the write rather than stopped before it. That delete can lose a "
+                    "race with the store's write visibility and leave the fact searchable. "
+                    "Use a provider that supports the gate, or infer=False for content that "
+                    "must never be written.",
+                    type(self._provider).__name__,
+                )
+
         return await self._provider.add(
             messages,
+            **provider_kwargs,
             **identifiers,
             metadata=metadata_dict,
             custom_prompt=custom_prompt,

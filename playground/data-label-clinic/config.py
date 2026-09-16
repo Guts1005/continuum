@@ -276,24 +276,24 @@ def mask_ssn(prompt: str, content: str) -> tuple[str, bool, str | None]:
 def _pii_pre_store_filter(facts: list[str]) -> list[str]:
     """Keep only the extracted facts that carry no SSN.
 
-    A ``pre_store_filter`` sees the facts mem0 extracted and returns the ones
-    allowed to remain. The name promises a gate before the write and there is
-    not one: mem0 fuses extraction and storage, so by the time these texts exist
-    they are already in the vector store, and rejecting one is a *delete* rather
-    than a veto.
+    A ``pre_store_filter`` is offered each fact mem0 extracted and returns the
+    ones allowed to remain. A rejected fact is never written: the gate sits
+    inside mem0's own ``_create_memory``, so there is no row to undo.
 
-    That delete races Milvus's write visibility and loses more often than the
-    earlier "searchable for roughly 280ms" note here suggested. Measured live:
-    the SSN fact was rejected and the immediate delete FAILED, and it was still
-    searchable minutes later; retrying the same id long afterwards returned True
-    and removed it. So the row is not permanently undeletable -- the delete
-    issued milliseconds after the write simply loses, and how long the fact
-    stays depends on whether anyone acts on the ERROR naming its id.
+    It was not always so, and the history is the reason the mechanism looks the
+    way it does. mem0 fuses extraction and storage, so this used to run on rows
+    that already existed and rejection meant deleting them -- and against Milvus
+    that delete lost a race it could not win. Measured live from this very
+    filter: the SSN fact was rejected, the immediate delete FAILED, and it was
+    still searchable minutes later.
 
-    Treat it as damage control with an audit trail, not prevention. What it buys
-    is a record and an attempted deletion; what it cannot buy is the fact never
-    having been written. Use ``infer=False`` for content that must never be
-    stored at all.
+    Facts arrive one at a time (the batch is not known until mem0 has finished
+    extracting), so this signature is called as ``filter([fact])``. Returning the
+    fact keeps it; anything else drops it.
+
+    Still not a substitute for keeping content out of the input: the SSN reaches
+    the model and the session transcript either way. Use an input scanner, or
+    ``infer=False``, for content that must never get that far.
     """
     return [f for f in facts if not _SSN_RE.search(f)]
 
@@ -319,8 +319,10 @@ def build_pre_store_filter() -> Callable[[list[str]], list[str]] | None:
         closed -- there is no rule to be safe about.
     pii -- drop any extracted fact containing an SSN.
     broken -- a filter that raises, to show the write path failing CLOSED:
-        every fact from that write is rejected and deleted, and it is reported
-        at ERROR rather than whispered at warning.
+        every fact from that write is suppressed before it is written, and it is
+        reported at ERROR rather than whispered at warning. Note it takes the
+        harmless preference with it: a filter that crashed has said nothing
+        about any of the facts, so none may stay.
     """
     mode = os.environ.get("CLINIC_FILTER", "off")
     if mode == "pii":

@@ -196,6 +196,12 @@ class MemoryAddResult(BaseModel):
     results: list[dict[str, Any]] = Field(default_factory=list)
     relations: list[dict[str, Any]] = Field(default_factory=list)
 
+    # Facts a pre_store_filter stopped before the write. They are NOT in the
+    # store, but mem0's ADD branch still returns them (it appends the result
+    # entry whatever _create_memory returned), so `results` alone would report a
+    # suppressed fact as stored.
+    suppressed: list[str] = Field(default_factory=list)
+
     @classmethod
     def from_mem0_response(cls, response: dict[str, Any] | str) -> "MemoryAddResult":
         """Create MemoryAddResult from mem0 add response."""

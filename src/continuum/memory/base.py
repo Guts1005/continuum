@@ -50,6 +50,7 @@ class BaseMemoryProvider(ABC):
         metadata: dict[str, Any] | None = None,
         custom_prompt: str | None = None,
         infer: bool = True,
+        pre_store_filter: Any | None = None,
     ) -> MemoryAddResult:
         """
         Add memories from messages or text.
