@@ -128,9 +128,24 @@ def _make_mem0_provider():
         history_db_path="/tmp/test_adversarial.db",
     )
     mock_sync_memory = MagicMock()
-    with patch("continuum.memory.providers.mem0.Memory") as MockMemory:
-        MockMemory.from_config.return_value = mock_sync_memory
+    # Patch the GATED class factory, not `mem0.Memory`. Since pre_store_filter
+    # became a real gate, _initialize builds `build_filtered_memory_class()` --
+    # a Memory subclass with the gate mixed in -- and calls from_config on that.
+    # Patching `continuum.memory.providers.mem0.Memory` still "succeeds" but
+    # covers nothing, so a REAL mem0 Memory gets constructed: it needs
+    # OPENAI_API_KEY, which a developer's .env supplies and CI does not. That is
+    # how this passed locally and failed in CI, while quietly doing real setup in
+    # a unit test either way.
+    with patch(
+        "continuum.memory.providers.filtered_memory.build_filtered_memory_class"
+    ) as mock_factory:
+        mock_factory.return_value.from_config.return_value = mock_sync_memory
         provider = Mem0Provider(config)
+        assert mock_factory.called, (
+            "Mem0Provider._initialize no longer goes through "
+            "build_filtered_memory_class, so this mock covers nothing and a real "
+            "mem0 Memory was constructed — repoint the patch at what it calls now"
+        )
     provider._sync_memory = mock_sync_memory
     return provider, mock_sync_memory
 
