@@ -180,7 +180,12 @@ def _gate_simulating_agent(tool_labels: dict[str, set[str]]):
     seen: dict[str, set[str]] = {}
 
     async def fake_exec(
-        tool_calls, trace_id=None, policy_store=None, subject=None, data_labels=None
+        tool_calls,
+        trace_id=None,
+        policy_store=None,
+        subject=None,
+        data_labels=None,
+        approval=None,
     ):
         tc = tool_calls[0]
         name = tc.function.name

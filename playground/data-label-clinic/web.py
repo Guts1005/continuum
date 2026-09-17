@@ -91,6 +91,18 @@ class MemWriteRequest(BaseModel):
     user_id: str = "u1"
 
 
+class ApprovalAnswerRequest(BaseModel):
+    key: str
+    approved: bool
+    reviewer: str = "ui"
+
+
+class ApprovalDecideRequest(BaseModel):
+    request_id: str
+    approved: bool
+    reviewer: str = "ui"
+
+
 class MemDeleteRequest(BaseModel):
     memory_id: str
 
@@ -321,6 +333,49 @@ async def memory_delete(req: MemDeleteRequest):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/approval/pending")
+async def approval_pending():
+    """What a reviewer should be shown right now (finding F7).
+
+    Polled on a SECOND connection while POST /chat is still open and blocked
+    inside the tool executor: the decision cannot come back on the request that
+    is waiting for it.
+    """
+    from approval_ui import pending_approvals
+
+    return {"pending": pending_approvals()}
+
+
+@app.get("/approval/queued")
+async def approval_queued():
+    """Calls parked by `queue` mode, waiting for someone to answer (F7).
+
+    Unlike /approval/pending these are not holding a turn open -- the turn
+    already ended and told the user it is pending.
+    """
+    from approval_ui import queued_approvals
+
+    return {"queued": queued_approvals()}
+
+
+@app.post("/approval/answer")
+async def approval_answer(req: ApprovalAnswerRequest):
+    """Answer a queued call. The next turn asking the same thing acts on it."""
+    from approval_ui import answer_queued
+
+    return {"ok": answer_queued(req.key, req.approved, reviewer=req.reviewer)}
+
+
+@app.post("/approval/decide")
+async def approval_decide(req: ApprovalDecideRequest):
+    """Resolve a waiting approval. ok=False means there was nothing to resolve --
+    already answered, or the SDK's approval_timeout already fired and denied it."""
+    from approval_ui import submit_decision
+
+    ok = submit_decision(req.request_id, req.approved, reviewer=req.reviewer)
+    return {"ok": ok}
+
+
 @app.post("/memory/approve")
 async def memory_approve(req: MemApproveRequest):
     """Human review: clear a row's provenance label and record who cleared it.
@@ -419,6 +474,31 @@ HTML_PAGE = """<!DOCTYPE html>
   pre { background: #0f1419; border: 1px solid #2a3548; border-radius: 6px; padding: 8px; font-size: 11px; overflow-x: auto; color: #cbd5e1; }
   .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
   .demo-btn { font-size: 12px; padding: 6px 10px; background: #243044; color: #cbd5e1; border: 1px solid #2a3548; border-radius: 6px; cursor: pointer; }
+  /* The approval prompt. Styled as a decision, not a status: it is the one
+     moment the demo asks the USER to act, and it previously reused the
+     "thinking…" bubble, so it rendered in muted italic and read as something
+     half-loaded. Amber left border to match .gate — both are the system
+     reporting a control firing — but with full-contrast text and real buttons,
+     because this one is waiting on a person. */
+  .approval { align-self: stretch; max-width: 100%; background: #1c2433; border: 1px solid #3b4a63;
+              border-left: 3px solid #fbbf24; border-radius: 8px; padding: 12px 14px; font-size: 13px; }
+  .approval-head { color: #fbbf24; font-weight: 600; letter-spacing: .02em; margin-bottom: 8px;
+                   display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .approval-tool { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #e6e6e6;
+                   background: #0f1419; border: 1px solid #2a3548; border-radius: 5px;
+                   padding: 2px 6px; font-size: 12px; }
+  .approval pre { margin: 8px 0 10px; padding: 8px 10px; background: #0f1419; border: 1px solid #2a3548;
+                  border-radius: 6px; color: #cbd5e1; font-size: 12px; white-space: pre-wrap;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .approval-actions { display: flex; gap: 8px; align-items: center; }
+  .btn-approve { padding: 7px 16px; background: #15803d; color: #eafbf0; border: none;
+                 border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .btn-deny { padding: 7px 16px; background: #1e293b; color: #fca5a5; border: 1px solid #7f1d1d;
+              border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .btn-approve:disabled, .btn-deny:disabled { opacity: .45; cursor: default; }
+  .approval-outcome { font-size: 12px; font-weight: 600; }
+  .approval-outcome.yes { color: #4ade80; }
+  .approval-outcome.no { color: #fca5a5; }
 </style>
 </head>
 <body>
@@ -558,6 +638,10 @@ async function sendMsg(){
   if(document.getElementById('stream-toggle').checked){ return sendMsgStream(text); }
   add('user', text); input.value=''; send.disabled=true;
   const thinking=add('thinking','…');
+  // F7: poll for approval prompts on a SECOND connection. /chat is blocked
+  // inside the tool executor waiting for an answer, so it cannot deliver the
+  // question that is blocking it.
+  const stopPolling=pollApprovals();
   try{
     const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:text,user_id:USER_ID,conversation_id:currentConversationId,scanner_on:scannerOn()})});
@@ -567,7 +651,75 @@ async function sendMsg(){
     if(d.failed){ renderUnknown(); } else { renderTaint(d.taint); renderModel(d.model_used); renderTools(d.tools_called); renderGates(d.gate_events); }
     listMem();      // long-term memory may have changed (stored, or blocked)
   }catch(e){ thinking.textContent='Error: '+e; }
+  stopPolling();
   send.disabled=false; input.focus();
+}
+
+// F7 approval prompts. Arguments are shown, not just the tool name: a reviewer
+// shown only a name is approving the name, and the arguments are the whole
+// reason this gate exists -- neither tool-trust nor the policy gate sees them.
+function pollApprovals(){
+  let live=true; const shown=new Set();
+  (async()=>{
+    while(live){
+      try{
+        const r=await fetch('/approval/pending'); const d=await r.json();
+        for(const p of (d.pending||[])){
+          if(shown.has(p.request_id)) continue;
+          shown.add(p.request_id); renderApproval(p);
+        }
+      }catch(e){ /* the turn may have ended; the loop exits on stopPolling */ }
+      await new Promise(r=>setTimeout(r,400));
+    }
+  })();
+  return ()=>{ live=false; };
+}
+
+function renderApproval(p){
+  const el=add('approval','');
+  const labels=(p.data_labels||[]).length
+    ? ' <span class="chip phi">'+p.data_labels.join(', ')+'</span>' : '';
+  // The arguments are the whole reason this gate exists -- neither the policy
+  // gate nor MCP tool-trust can see them, so neither could tell a routine call
+  // from a consequential one. A reviewer shown only a tool name is approving
+  // the name.
+  el.innerHTML='<div class="approval-head">&#9208; APPROVAL NEEDED'+labels+'</div>'
+    +'<span class="approval-tool">'+p.tool_name+'</span>'
+    +'<pre>'+JSON.stringify(p.arguments,null,2)+'</pre>'
+    +'<div class="approval-actions">'
+    +'<button class="btn-approve" data-ok="1">Approve</button>'
+    +'<button class="btn-deny" data-ok="0">Deny</button>'
+    +'<span class="approval-outcome"></span>'
+    +'</div>';
+  // Handlers attached rather than written into an onclick attribute. Building
+  // one needs a quoted argument, and a Python-escaped quote renders as a bare
+  // quote that closes the JS string early -- which broke this whole script
+  // block once already. No quotes to escape, no way to reintroduce it.
+  el.querySelectorAll('button').forEach(function(b){
+    b.addEventListener('click', function(){
+      decideApproval(p.request_id, b.dataset.ok === '1', b);
+    });
+  });
+}
+
+async function decideApproval(id, approved, btn){
+  const actions=btn.parentElement;
+  actions.querySelectorAll('button').forEach(b=>b.disabled=true);
+  const out=actions.querySelector('.approval-outcome');
+  const r=await fetch('/approval/decide',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({request_id:id, approved:approved, reviewer:'ui'})});
+  const d=await r.json();
+  // Written into a dedicated span rather than appended to innerHTML: rebuilding
+  // the parent would discard the listeners attached above, so a second prompt
+  // in the same turn would render dead buttons.
+  if(d.ok){
+    out.textContent = approved ? 'approved' : 'denied';
+    out.className = 'approval-outcome ' + (approved ? 'yes' : 'no');
+  } else {
+    out.textContent = 'too late \u2014 it already timed out and was denied';
+    out.className = 'approval-outcome no';
+  }
 }
 
 async function sendMsgStream(text){

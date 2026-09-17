@@ -6,7 +6,7 @@ Defines configuration classes for agents and agent execution.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -20,10 +20,12 @@ from continuum.config import settings
 
 # Type aliases for memory hooks
 MemoryPreStoreFilter = Callable[[list[str]], list[str]]
+ToolApprovalHandler = Callable[["ToolApprovalRequest"], Awaitable["ToolApprovalDecision"]]
 MemoryRecallAction = Literal["fence", "drop", "block"]
 MemoryOnStoredCallback = Callable[[list[str]], None]
 
 if TYPE_CHECKING:
+    from continuum.agent.approval import ToolApprovalDecision, ToolApprovalRequest
     from continuum.llm.context_management import ContextManagementConfig
     from continuum.tools.tool_attention.config import ToolAttentionConfig
 
@@ -311,6 +313,36 @@ class AgentConfig:
     # integrator declares provenance; the runtime only propagates it.
     #   e.g. {"fetch_patient_record": {"phi"}}
     tool_data_labels: dict[str, set[str]] = field(default_factory=dict)
+
+    # Human-in-the-loop approval — declare which tools a person must approve
+    # before they run (security finding F7). fnmatch patterns, written the same
+    # way as policy `resources` so there is one syntax to learn:
+    #   e.g. {"send_referral_email", "pharmacy__*", "*transfer*"}
+    #
+    # This is the only gate that sees the tool ARGUMENTS. Tool-trust vets the
+    # catalogue once per server; the policy gate checks `tool:{name}` and decides
+    # by rule. Neither can tell transfer(amount=5) from transfer(amount=5_000_000).
+    #
+    # No default list. `delete_*`/`send_*`/`pay_*` looks like a sensible default
+    # and is not one: it blocks a harmless send_receipt while missing wire_funds,
+    # and a gate nobody configured reads as more coverage than it gives.
+    tool_approval: set[str] = field(default_factory=set)
+
+    # Who decides. Separate from the list above so one handler serves every
+    # agent, and a deployment can swap a CLI prompt for Slack without touching
+    # any tool declaration. Declaring tools without a handler is reported once:
+    # a gate wired to nobody fails by doing nothing.
+    #   async def handler(req: ToolApprovalRequest) -> ToolApprovalDecision
+    approval_handler: ToolApprovalHandler | None = field(
+        default=None, repr=False, compare=False, hash=False
+    )
+
+    # How long to wait for a person. Default 30s because a blocked run holds an
+    # HTTP request open, and browsers, proxies and serverless platforms give up
+    # long before a reviewer does -- so the default has to sit inside ordinary
+    # limits and fail closed. A wait measured in hours needs Temporal, or a
+    # refuse-and-resume UI rather than a blocking one.
+    approval_timeout: float = 30.0
 
     # Dispatch priority for this agent's LLM calls (1=lowest, 10=highest, 5=default).
     # Used as the stage-level weight in TwoLevelDispatcher for internal models:

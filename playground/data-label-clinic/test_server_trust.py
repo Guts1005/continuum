@@ -23,6 +23,7 @@ be fully persuaded by a poisoned description and still fail to reach the tool.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import pathlib
@@ -961,3 +962,415 @@ class TestPharmacyOverStdio:
         for transport in ("streamable-http", "sse", "stdio"):
             for server in self._servers(transport).values():
                 assert agent.server_address(server)
+
+
+# ── F7: the human-in-the-loop approval gate ──────────────────────────────────
+
+
+class TestApprovalModes:
+    """CLINIC_APPROVAL picks who answers, the way CLINIC_FILTER picks a filter.
+
+    The gate is SDK-level; what the clinic supplies is the declaration (which
+    tools) and the handler (who answers). `off` stays the shipped default so the
+    demo starts in the state a new project is in.
+
+    The gated tool is check_interactions, not send_referral_email. That was the
+    first choice and a live run rejected it: ask for a referral email and the
+    model looks the patient up first, tainting the run PHI so the policy denies
+    the call before approval is consulted; forbid the lookup and the model
+    declines to send mail at all. A gate nothing reaches demonstrates nothing --
+    the same reason check_interactions carries the EXTERNAL rule in BM4.
+    """
+
+    def _build(self, monkeypatch, mode):
+        import importlib
+
+        import config as clinic_config
+
+        monkeypatch.setenv("CLINIC_APPROVAL", mode)
+        importlib.reload(clinic_config)
+        return clinic_config
+
+    def test_off_declares_no_tools(self, monkeypatch):
+        cfg = self._build(monkeypatch, "off")
+        assert cfg.build_approval_tools() == set()
+        assert cfg.build_approval_handler() is None
+
+    def test_auto_declares_the_gated_tool(self, monkeypatch):
+        cfg = self._build(monkeypatch, "auto")
+        assert cfg.APPROVAL_TOOL in cfg.build_approval_tools()
+        assert cfg.build_approval_handler() is not None
+
+    async def test_auto_approves_without_a_person(self, monkeypatch):
+        """So a scripted run can exercise the approved path end to end."""
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._build(monkeypatch, "auto")
+        decision = await cfg.build_approval_handler()(
+            ToolApprovalRequest(
+                tool_name=cfg.APPROVAL_TOOL,
+                arguments={"medications": ["metformin", "lisinopril"]},
+                agent_name="clinic",
+            )
+        )
+        assert decision.approved
+
+    async def test_deny_refuses_and_says_why(self, monkeypatch):
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._build(monkeypatch, "deny")
+        decision = await cfg.build_approval_handler()(
+            ToolApprovalRequest(tool_name=cfg.APPROVAL_TOOL, arguments={}, agent_name="clinic")
+        )
+        assert not decision.approved
+        assert decision.reason
+
+    def test_ask_wires_the_ui_handler(self, monkeypatch):
+        """`ask` is the mode that actually blocks on a person; the handler comes
+        from approval_ui so the prompt can reach a browser."""
+        cfg = self._build(monkeypatch, "ask")
+        assert cfg.APPROVAL_TOOL in cfg.build_approval_tools()
+        assert cfg.build_approval_handler() is not None
+
+    def test_an_unknown_mode_gates_nothing_rather_than_guessing(self, monkeypatch):
+        cfg = self._build(monkeypatch, "wat")
+        assert cfg.build_approval_tools() == set()
+
+    def test_temporal_declares_the_gated_tool(self, monkeypatch):
+        """AP6. The durable route is a mode like the others, so the guide can
+        give one command instead of a code snippet the reader has to assemble."""
+        cfg = self._build(monkeypatch, "temporal")
+        assert cfg.APPROVAL_TOOL in cfg.build_approval_tools()
+        assert cfg.build_approval_handler() is not None
+
+    def test_temporal_wires_the_self_resolving_handler(self, monkeypatch):
+        """Not a clinic handler: the SDK's, which finds its own workflow from
+        activity.info(). Wiring a local one here would make AP6 prove nothing
+        about the durable route."""
+        cfg = self._build(monkeypatch, "temporal")
+        handler = cfg.build_approval_handler()
+        assert handler.__module__.startswith("continuum.temporal"), (
+            f"expected the SDK's temporal handler, got {handler.__module__}"
+        )
+
+    async def test_temporal_outside_a_workflow_defers_rather_than_approving(self, monkeypatch):
+        """Running this mode in `python web.py` reaches no workflow. It must not
+        approve -- that would let the call through unreviewed by the very
+        configuration that asked for review."""
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._build(monkeypatch, "temporal")
+        decision = await cfg.build_approval_handler()(
+            ToolApprovalRequest(tool_name=cfg.APPROVAL_TOOL, arguments={}, agent_name="clinic")
+        )
+        assert not decision.approved
+        assert decision.deferred
+
+    def test_the_temporal_timeout_is_not_the_http_one(self, monkeypatch):
+        """The whole point of AP6 is a reviewer who is not watching, so the
+        30s default that keeps `ask` inside proxy limits is wrong here."""
+        cfg = self._build(monkeypatch, "temporal")
+        assert cfg.approval_timeout() >= 300, (
+            "temporal mode still uses the HTTP-safe timeout, so a reviewer who "
+            "takes a minute gets denied — which is the case AP6 exists for"
+        )
+
+    def test_the_timeout_is_switchable_and_defaults_http_safe(self, monkeypatch):
+        """A blocked run holds the HTTP request open, so the default has to sit
+        inside ordinary proxy limits rather than match how long a reviewer takes.
+        """
+        cfg = self._build(monkeypatch, "off")
+        assert 0 < cfg.approval_timeout() <= 60
+        monkeypatch.setenv("CLINIC_APPROVAL_TIMEOUT", "3")
+        assert cfg.approval_timeout() == 3.0
+        monkeypatch.setenv("CLINIC_APPROVAL_TIMEOUT", "not-a-number")
+        assert cfg.approval_timeout() == 30.0
+
+
+class TestTheUiApprovalHandler:
+    """`ask` parks the tool call on a future that a SECOND request resolves.
+    POST /chat is already blocked inside the tool executor, so the decision
+    cannot come back on the connection that is waiting for it."""
+
+    async def test_a_pending_prompt_carries_the_arguments(self):
+        import asyncio
+
+        from approval_ui import pending_approvals, submit_decision, ui_approval_handler
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        req = ToolApprovalRequest(
+            tool_name="pharmacy__check_interactions",
+            arguments={"medications": ["metformin", "lisinopril"]},
+            agent_name="clinic",
+            data_labels=frozenset({"external"}),
+        )
+        task = asyncio.create_task(ui_approval_handler(req))
+        await asyncio.sleep(0)
+
+        pending = pending_approvals()
+        assert len(pending) == 1
+        # A reviewer shown only a tool name is approving the name. The arguments
+        # are the whole reason this gate exists.
+        assert pending[0]["arguments"] == {"medications": ["metformin", "lisinopril"]}
+        assert pending[0]["data_labels"] == ["external"]
+
+        assert submit_decision(pending[0]["request_id"], approved=True, reviewer="tom")
+        decision = await task
+        assert decision.approved
+        assert decision.reviewer == "tom"
+
+    async def test_answering_twice_is_refused(self):
+        """The second click must not resolve a future that is already done."""
+        import asyncio
+
+        from approval_ui import pending_approvals, submit_decision, ui_approval_handler
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        task = asyncio.create_task(
+            ui_approval_handler(
+                ToolApprovalRequest(tool_name="t", arguments={}, agent_name="clinic")
+            )
+        )
+        await asyncio.sleep(0)
+        rid = pending_approvals()[0]["request_id"]
+        assert submit_decision(rid, approved=True)
+        await task
+        assert not submit_decision(rid, approved=False), "a resolved prompt was answered again"
+
+    async def test_an_abandoned_prompt_does_not_linger(self):
+        """When the SDK's timeout cancels the handler, the prompt must leave the
+        panel -- otherwise it sits there claiming to be live and a click reports
+        'too late' with no explanation of why."""
+        import asyncio
+
+        from approval_ui import pending_approvals, ui_approval_handler
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        task = asyncio.create_task(
+            ui_approval_handler(
+                ToolApprovalRequest(tool_name="t", arguments={}, agent_name="clinic")
+            )
+        )
+        await asyncio.sleep(0)
+        assert pending_approvals()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert pending_approvals() == []
+
+    async def test_deciding_an_unknown_id_is_reported_not_raised(self):
+        from approval_ui import submit_decision
+
+        assert not submit_decision("no-such-id", approved=True)
+
+
+class TestTheAgentDeclaresApproval:
+    def test_the_agent_passes_all_three_fields(self):
+        """Declaring tools without a handler is the misconfiguration the SDK
+        warns about, so the clinic sets both from one place and they cannot
+        drift apart."""
+        import inspect
+
+        import agent as clinic_agent
+
+        src = inspect.getsource(clinic_agent)
+        assert "tool_approval=" in src
+        assert "approval_handler=" in src
+        assert "approval_timeout=" in src
+
+    def test_an_approval_denial_reaches_the_glassbox(self):
+        """The panel is the whole point of the clinic. A refusal that does not
+        appear there is indistinguishable from the tool quietly not running."""
+        import inspect
+
+        import agent as clinic_agent
+
+        src = inspect.getsource(clinic_agent)
+        assert "APPROVAL DENIED" in src, "approval denials are not surfaced as gate events"
+
+
+class TestQueueMode:
+    """`queue` is refuse-and-resume: the turn ends at once saying pending, a
+    reviewer answers out of band, and a later turn asking the same thing
+    proceeds. The shape for a reviewer who is not watching a screen, and the one
+    that does not hold an HTTP request open."""
+
+    def _cfg(self, monkeypatch):
+        import importlib
+
+        import config as clinic_config
+
+        monkeypatch.setenv("CLINIC_APPROVAL", "queue")
+        importlib.reload(clinic_config)
+        return clinic_config
+
+    def test_queue_declares_the_gated_tool(self, monkeypatch):
+        cfg = self._cfg(monkeypatch)
+        assert cfg.APPROVAL_TOOL in cfg.build_approval_tools()
+
+    async def test_the_first_ask_defers_rather_than_refusing(self, monkeypatch):
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._cfg(monkeypatch)
+        d = await cfg.build_approval_handler()(
+            ToolApprovalRequest(
+                tool_name=cfg.APPROVAL_TOOL,
+                arguments={"medications": ["a", "b"]},
+                agent_name="clinic",
+            )
+        )
+        assert d.deferred, "a queued call must be pending, not refused"
+        assert not d.approved
+
+    async def test_a_later_ask_acts_on_the_answer(self, monkeypatch):
+        """The resume half. Keyed on (tool, arguments) because the second turn
+        is a different run asking the same question -- there is no request id to
+        carry over, and the SDK deliberately remembers nothing between runs."""
+        from approval_ui import answer_queued, queued_approvals
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._cfg(monkeypatch)
+        handler = cfg.build_approval_handler()
+        req = ToolApprovalRequest(
+            tool_name=cfg.APPROVAL_TOOL,
+            arguments={"medications": ["metformin", "lisinopril"]},
+            agent_name="clinic",
+        )
+        assert (await handler(req)).deferred
+
+        # Matched on the arguments, not just the tool: the queue is a module
+        # global that outlives a test, so "the first entry for this tool" can be
+        # another test's. Real deployments hit the same thing -- the store is
+        # shared across every run, which is why the key includes the arguments.
+        want = {"medications": ["metformin", "lisinopril"]}
+        queued = [q for q in queued_approvals() if q["arguments"] == want]
+        assert queued, "the call was not parked for a reviewer"
+        assert answer_queued(queued[0]["key"], approved=True, reviewer="tom")
+
+        second = await handler(req)
+        assert second.approved
+        assert second.reviewer == "tom"
+
+    async def test_an_answer_authorises_one_execution_not_a_standing_permit(self, monkeypatch):
+        """Otherwise one approval silently covers every future call with the
+        same arguments -- which is the cached-approval hazard the SDK refuses to
+        build in."""
+        from approval_ui import answer_queued, queued_approvals
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._cfg(monkeypatch)
+        handler = cfg.build_approval_handler()
+        req = ToolApprovalRequest(
+            tool_name=cfg.APPROVAL_TOOL, arguments={"medications": ["x"]}, agent_name="clinic"
+        )
+        await handler(req)
+        key = [q for q in queued_approvals() if q["arguments"] == {"medications": ["x"]}][0]["key"]
+        answer_queued(key, approved=True)
+        assert (await handler(req)).approved
+
+        # asking a third time starts over
+        assert (await handler(req)).deferred
+
+    async def test_a_refusal_from_the_queue_is_a_refusal_not_a_deferral(self, monkeypatch):
+        from approval_ui import answer_queued, queued_approvals
+
+        from continuum.agent.approval import ToolApprovalRequest
+
+        cfg = self._cfg(monkeypatch)
+        handler = cfg.build_approval_handler()
+        req = ToolApprovalRequest(
+            tool_name=cfg.APPROVAL_TOOL, arguments={"medications": ["y"]}, agent_name="clinic"
+        )
+        await handler(req)
+        key = [q for q in queued_approvals() if q["arguments"] == {"medications": ["y"]}][0]["key"]
+        answer_queued(key, approved=False, reviewer="bob")
+
+        d = await handler(req)
+        assert not d.approved
+        assert not d.deferred, "a declined queued call is refused, not still pending"
+
+    def test_answering_an_unknown_key_is_reported_not_raised(self, monkeypatch):
+        from approval_ui import answer_queued
+
+        self._cfg(monkeypatch)
+        assert not answer_queued("no-such-key", approved=True)
+
+    def test_a_deferral_reaches_the_glassbox(self):
+        """⏳ rather than ⏸: 'nobody has answered yet' is resumable and 'a person
+        said no' is not, which is the whole difference the state exists for."""
+        import inspect
+
+        import agent as clinic_agent
+
+        src = inspect.getsource(clinic_agent)
+        assert "APPROVAL PENDING" in src
+
+
+class TestThePageScriptParses:
+    """The clinic's inline JavaScript must parse, checked on the RENDERED page.
+
+    A syntax error anywhere in a <script> block kills the whole block, so every
+    function in it is undefined: the Send button does nothing, the glassbox
+    panel never populates, and the page looks like a backend failure while the
+    backend is answering perfectly.
+
+    Checked against ``web.HTML_PAGE`` -- the string a browser receives -- and not
+    against web.py's source, because that distinction is the bug this exists to
+    catch. The approval prompt was written with ``\\'`` inside a Python string:
+    valid in the source, and rendered as a bare ``'`` that terminates the JS
+    string. Extracting the script from web.py's SOURCE parsed fine and the page
+    was broken, which is exactly what happened.
+
+    The shop grew this guard after the same class of bug (a ``\\n`` inside a
+    single-quoted JS string). The clinic never did, so this one shipped.
+    """
+
+    def test_the_rendered_page_script_is_valid_javascript(self):
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not available to parse the page script")
+
+        import web
+
+        blocks = re.findall(r"<script>(.*?)</script>", web.HTML_PAGE, re.S)
+        assert blocks, "no inline script found — the extraction is looking in the wrong place"
+
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write("\n".join(blocks))
+            path = fh.name
+        result = subprocess.run([node, "--check", path], capture_output=True, text=True)
+        assert result.returncode == 0, (
+            f"the page's inline JavaScript does not parse, so nothing on the page "
+            f"works:\n{result.stderr}"
+        )
+
+    def test_no_escaped_quotes_survive_into_the_rendered_script(self):
+        """The specific shape that broke it, kept as a named guard.
+
+        A `\\'` in the Python source renders as a bare `'`. Inside a
+        single-quoted JS string being concatenated, that closes the string early
+        and the parse error is several lines further on, where it is hard to
+        read back to the cause.
+        """
+        import re
+
+        import web
+
+        blocks = "\n".join(re.findall(r"<script>(.*?)</script>", web.HTML_PAGE, re.S))
+        offenders = [
+            ln.strip() for ln in blocks.splitlines() if re.search(r"onclick=\"[^\"]*''", ln)
+        ]
+        assert not offenders, (
+            "an onclick argument rendered as an empty string pair — a Python-escaped "
+            f"quote leaked through: {offenders[:2]}"
+        )

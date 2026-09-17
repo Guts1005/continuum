@@ -27,6 +27,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -55,6 +56,9 @@ for _var in (
         os.environ.pop(_var, None)
 
 from continuum.security.policy import AccessPolicy, PolicyStore
+
+if TYPE_CHECKING:
+    from continuum.agent.approval import ToolApprovalDecision, ToolApprovalRequest
 
 # --- the PHI label -------------------------------------------------------- #
 PHI = "phi"
@@ -329,6 +333,122 @@ def build_pre_store_filter() -> Callable[[list[str]], list[str]] | None:
         return _pii_pre_store_filter
     if mode == "broken":
         return _broken_pre_store_filter
+    return None
+
+
+# --- human-in-the-loop approval (the SDK's tool_approval hook, finding F7) -- #
+#
+# The gate is SDK-level: it fires inside the tool executor, receives the call's
+# ARGUMENTS, and fails closed. What the clinic supplies is the declaration (which
+# tools) and the handler (who answers) -- the SDK ships neither, because a
+# default list of "risky" names blocks a harmless send_receipt while missing
+# wire_funds.
+#
+# check_interactions, for the same reason it carries the EXTERNAL policy rule:
+# it is the consequential action the model will actually attempt. The obvious
+# choice was send_referral_email, and a live run showed why it does not work --
+# the model refuses to send mail until it has looked a patient up, and that
+# lookup taints the run PHI, so phi-no-exfiltration-tools denies the call before
+# approval is ever consulted. Both failure modes were observed: with a patient
+# lookup the policy fires first, without one the model declines by itself. A
+# gate nothing reaches demonstrates nothing.
+#
+# The pairing is the point. BM4 shows the policy DENYING check_interactions to
+# an EXTERNAL run; BM11 shows a person being ASKED about it on a clean one --
+# the same action, the two postures, and the difference between a rule deciding
+# and a human deciding.
+
+APPROVAL_TOOL = "pharmacy__check_interactions"
+
+
+async def _auto_approve(request: ToolApprovalRequest) -> ToolApprovalDecision:
+    """Approve without a person, so a scripted run can reach the approved path."""
+    from continuum.agent.approval import ToolApprovalDecision
+
+    return ToolApprovalDecision(approved=True, reviewer="auto (CLINIC_APPROVAL=auto)")
+
+
+async def _always_deny(request: ToolApprovalRequest) -> ToolApprovalDecision:
+    """Refuse every request -- the denial path without waiting on a human."""
+    from continuum.agent.approval import ToolApprovalDecision
+
+    return ToolApprovalDecision(
+        approved=False,
+        reviewer="auto (CLINIC_APPROVAL=deny)",
+        reason="Refused by the scripted reviewer.",
+    )
+
+
+def approval_timeout() -> float:
+    """How long the gate waits for a person.
+
+    Switchable because the limit is the point: a blocked run holds the HTTP
+    request open, so this has to stay inside browser and proxy limits rather
+    than match how long a reviewer actually takes. Set it to 3 and walk away to
+    watch it fail closed.
+
+    `temporal` defaults to 600 instead of 30. Nothing is holding an HTTP request
+    open there -- the activity blocks and heartbeats -- so the constraint that
+    sets 30 does not apply, and 30 would deny a reviewer who took half a minute,
+    which is exactly the case AP6 exists for.
+    """
+    default = "600" if os.environ.get("CLINIC_APPROVAL") == "temporal" else "30"
+    try:
+        return float(os.environ.get("CLINIC_APPROVAL_TIMEOUT", default))
+    except ValueError:
+        return float(default)
+
+
+def build_approval_tools() -> set[str]:
+    """Which tools need a person. Empty unless CLINIC_APPROVAL asks for one."""
+    if os.environ.get("CLINIC_APPROVAL", "off") in ("auto", "deny", "ask", "queue", "temporal"):
+        return {APPROVAL_TOOL}
+    return set()
+
+
+def build_approval_handler():
+    """Who answers.
+
+    off (default) -- nobody, and nothing is declared either, so the gate is
+        inert. This is the state a new project starts in.
+    auto -- approve programmatically. For scripted runs that need the approved
+        path without a browser.
+    deny -- refuse programmatically. Shows what the model is told when a person
+        says no, without waiting for one.
+    ask -- a real prompt in the web UI, blocking the turn while a reviewer
+        answers. Needs the reviewer to be watching, because the HTTP request
+        stays open the whole time.
+    queue -- refuse and resume. The first ask is DEFERRED: the turn ends at once
+        telling the user it is pending, somebody answers out of band, and the
+        next turn asking the same thing proceeds. The shape for a reviewer who
+        is not sitting there, and the one that does not hold a connection open.
+    temporal -- the durable route. The turn BLOCKS IN PLACE inside a Temporal
+        activity and resumes when answered, so work done before the gate is not
+        repeated and nobody has to ask again. Needs a workflow, so it is driven
+        by `python approval_temporal.py`, not by web.py.
+    """
+    mode = os.environ.get("CLINIC_APPROVAL", "off")
+    if mode == "auto":
+        return _auto_approve
+    if mode == "deny":
+        return _always_deny
+    if mode == "ask":
+        from approval_ui import ui_approval_handler
+
+        return ui_approval_handler
+    if mode == "queue":
+        from approval_ui import queue_approval_handler
+
+        return queue_approval_handler
+    if mode == "temporal":
+        # The SDK's handler, not a clinic one. It resolves its own workflow at
+        # call time -- the id from activity.info(), the handle from the GLOBAL
+        # Temporal client -- because an agent is built long before any workflow
+        # exists. Run by approval_temporal.py; under `python web.py` there is no
+        # activity, so every request defers rather than proceeding unreviewed.
+        from continuum.temporal import temporal_tool_approval
+
+        return temporal_tool_approval()
     return None
 
 

@@ -31,6 +31,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 from config import (
     PHI,
     ClinicConfig,
+    approval_timeout,
+    build_approval_handler,
+    build_approval_tools,
     build_policy_store,
     build_pre_store_filter,
     default_config,
@@ -302,6 +305,14 @@ class ClinicAgent:
                 # SDK output-scanner hook: masks SSNs in the visible answer.
                 # Composes with the gates (independent, runs at a different point).
                 output_scanners=self.config.output_scanners,
+                # Human-in-the-loop (F7). The same tool BM4 shows the policy
+                # DENYING to an EXTERNAL run: policy refuses outright, approval
+                # asks a person. Both fields come from config so they cannot
+                # drift into "declared with nobody to ask", which the SDK warns
+                # about and the gate refuses.
+                tool_approval=build_approval_tools(),
+                approval_handler=build_approval_handler(),
+                approval_timeout=approval_timeout(),
             ),
         )
 
@@ -428,6 +439,19 @@ class ClinicAgent:
             if role == "tool":
                 if "POLICY DENIED" in content:
                     gate_events.append(f"🛡️ TOOL — blocked: {content.strip()[:200]}")
+                elif "APPROVAL PENDING" in content:
+                    # Deferred, not refused. Shown with ⏳ rather than ⏸ so the
+                    # panel distinguishes "a person said no" from "nobody has
+                    # answered yet" -- the second is resumable and the first is
+                    # not, which is the whole difference the state exists for.
+                    gate_events.append(f"⏳ TOOL — awaiting approval: {content.strip()[:200]}")
+                elif "APPROVAL DENIED" in content:
+                    # A person said no, or nobody answered inside the timeout.
+                    # Surfaced separately from a policy denial because the panel
+                    # is a glassbox: "a rule refused" and "a human refused" are
+                    # different events, and which one happened is the part worth
+                    # seeing.
+                    gate_events.append(f"⏸ TOOL — not approved: {content.strip()[:200]}")
             # assistant turns carry the tool_calls that were issued
             for tc in self._mfield(m, "tool_calls") or []:
                 name = getattr(getattr(tc, "function", None), "name", None) or (
