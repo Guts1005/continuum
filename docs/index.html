@@ -2673,6 +2673,51 @@ runner = <span class="cls">AgentRunner</span>()  <span class="cm"># one per app;
   <p><strong>Only a handler may defer.</strong> A timeout or a crash is a refusal: nothing is queued, so promising a resumption would promise something nothing is going to deliver.</p>
   <p>A refusal becomes a <strong>tool result</strong>, not a raised exception. The model reads it and tells the user; the turn ends normally rather than crashing over a decision the system made on purpose.</p>
 
+
+  <h3>Two shapes of handler</h3>
+  <p>The three outcomes give you two ways to build. The choice is <strong>where the wait lives</strong>.</p>
+
+  <p><strong>Blocking</strong> — hold the call until someone answers. The answer arrives on a different connection than the one waiting, so the handler parks on a <code>Future</code> that your endpoint resolves:</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre>_PENDING: dict[str, dict] = {}
+
+<span class="kw">async def</span> <span class="fn">blocking_handler</span>(request):
+    fut = asyncio.get_running_loop().create_future()
+    request_id = uuid.uuid4().hex[:<span class="num">8</span>]
+    _PENDING[request_id] = {<span class="str">"request"</span>: request, <span class="str">"future"</span>: fut}
+    <span class="kw">try</span>:
+        <span class="kw">return await</span> fut                       <span class="cm"># the turn stops here</span>
+    <span class="kw">finally</span>:
+        _PENDING.pop(request_id, <span class="kw">None</span>)         <span class="cm"># also on the SDK's timeout</span>
+
+<span class="cm"># elsewhere — your "approve" endpoint</span>
+<span class="kw">def</span> <span class="fn">decide</span>(request_id, approved):
+    _PENDING[request_id][<span class="str">"future"</span>].set_result(
+        <span class="cls">ToolApprovalDecision</span>(approved=approved, reviewer=<span class="str">"alice"</span>))</pre></div>
+  <p>Give your UI a second endpoint that reads <code>_PENDING</code> — the request holding the turn cannot deliver the question blocking it.</p>
+  <p>No timeout of your own: <code>approval_timeout</code> already bounds this and denies on expiry. It also <strong>cancels</strong> the handler, which is why the cleanup is in <code>finally</code> rather than after the <code>await</code>.</p>
+
+  <p><strong>Refuse-and-resume</strong> — return immediately, answer out of band:</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="kw">async def</span> <span class="fn">deferring_handler</span>(request):
+    key = <span class="str">f"{request.tool_name}::{json.dumps(request.arguments, sort_keys=True)}"</span>
+    answer = store.pop(key, <span class="kw">None</span>)              <span class="cm"># answered since last time?</span>
+    <span class="kw">if</span> answer <span class="kw">is not</span> <span class="kw">None</span>:
+        <span class="kw">return</span> <span class="cls">ToolApprovalDecision</span>(approved=answer[<span class="str">"approved"</span>],
+                                    reviewer=answer[<span class="str">"reviewer"</span>])
+    store.park(key, request)                   <span class="cm"># queue it for a reviewer</span>
+    <span class="kw">return</span> <span class="cls">ToolApprovalDecision</span>(approved=<span class="kw">False</span>, deferred=<span class="kw">True</span>)</pre></div>
+  <p>The turn ends telling the user it is pending. Someone answers into <code>store</code>, and the <strong>next</strong> run asking the same thing proceeds. There is no <code>request_id</code> to carry over — the second run is a different run — so the key is the tool and its arguments.</p>
+  <p><code>store.pop</code> rather than <code>store.get</code>: one answer authorises <strong>one</strong> execution, not a standing permit.</p>
+
+  <table>
+    <tr><th></th><th>Blocking</th><th>Refuse-and-resume</th></tr>
+    <tr><td>the turn</td><td>held open</td><td>ends immediately</td></tr>
+    <tr><td>bounded by</td><td>browser/proxy limits, <code>approval_timeout</code></td><td>nothing</td></tr>
+    <tr><td>reviewer must be</td><td>watching now</td><td>anywhere, any time</td></tr>
+    <tr><td>cost</td><td>a held connection</td><td>the turn's work is redone when asked again</td></tr>
+    <tr><td>survives a restart</td><td>no</td><td>yes — nothing is held to lose</td></tr>
+  </table>
+  <p>Neither is more correct. Use blocking for an interactive UI where someone is looking at the screen; use refuse-and-resume for Slack, email, or anything asynchronous. The Temporal handler below is a third point: it blocks in place <em>without</em> holding a connection open.</p>
+
   <h3>What the handler is shown</h3>
   <table>
     <tr><th>Field</th><th>Why it is there</th></tr>
