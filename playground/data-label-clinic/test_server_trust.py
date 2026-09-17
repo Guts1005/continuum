@@ -1368,9 +1368,7 @@ class TestThePageScriptParses:
 
         blocks = "\n".join(re.findall(r"<script>(.*?)</script>", web.HTML_PAGE, re.S))
         offenders = [
-            ln.strip()
-            for ln in blocks.splitlines()
-            if re.search(r"onclick=\"[^\"]*''", ln)
+            ln.strip() for ln in blocks.splitlines() if re.search(r"onclick=\"[^\"]*''", ln)
         ]
         assert not offenders, (
             "an onclick argument rendered as an empty string pair — a Python-escaped "

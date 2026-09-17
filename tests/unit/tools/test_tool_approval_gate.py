@@ -253,9 +253,7 @@ class TestDeferralAtTheGate:
         ex = _executor()
         settings = _settings({"send_referral_email"}, defer)
         invoked = AsyncMock(return_value=("sent", None))
-        monkeypatch.setattr(
-            "continuum.tools.util.MCPUtil.invoke_mcp_tool_with_artifact", invoked
-        )
+        monkeypatch.setattr("continuum.tools.util.MCPUtil.invoke_mcp_tool_with_artifact", invoked)
 
         with pytest.raises(ToolApprovalDeniedError) as exc:
             await ex.execute_tool_call(_call(), approval=settings)

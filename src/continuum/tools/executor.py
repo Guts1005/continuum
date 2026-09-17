@@ -1013,7 +1013,9 @@ class ToolExecutor:
                         # PENDING, not DENIED. A user told their request was
                         # refused does not go looking for an approver, and this
                         # one is waiting on exactly that.
-                        content = f"APPROVAL PENDING: '{tc.function.name}' has been sent for approval"
+                        content = (
+                            f"APPROVAL PENDING: '{tc.function.name}' has been sent for approval"
+                        )
                         content += f". {reason}" if reason else "."
                         content += (
                             " It has NOT been performed. Tell the user it is awaiting approval "

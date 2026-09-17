@@ -154,9 +154,11 @@ async def main() -> int:
         else:
             print("waiting for a reviewer. Answer it with submit_approval —")
             print("  from the Temporal UI at http://localhost:8233, or:")
-            print(f'  handle.signal("submit_approval", ApprovalDecision('
-                  f'request_id="{prompt["request_id"]}", decision="approved", '
-                  f'decided_by="you"))')
+            print(
+                f'  handle.signal("submit_approval", ApprovalDecision('
+                f'request_id="{prompt["request_id"]}", decision="approved", '
+                f'decided_by="you"))'
+            )
             print()
 
         result = await handle.result()

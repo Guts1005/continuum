@@ -14,8 +14,19 @@ happens not to take.
 
 from __future__ import annotations
 
+import importlib.util
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
+
+# Most of this file is pure wiring and needs no optional extra. One class reaches
+# into continuum.temporal, which raises ImportError without `.[temporal]` — a
+# developer venv has it and CI does not, so an unguarded class passes locally and
+# fails in CI. Skipped at class level rather than module level: the wiring
+# assertions must keep running everywhere, since they are the ones guarding
+# against a gate that is configured but connected to nothing.
+_HAS_TEMPORAL = importlib.util.find_spec("temporalio") is not None
 
 
 def _agent(*, tools=None, handler=None, timeout=30.0, name="clinic"):
@@ -129,6 +140,7 @@ async def _run_tool_service(service_cls, *, streaming: bool):
     return captured
 
 
+@pytest.mark.skipif(not _HAS_TEMPORAL, reason="the temporal extra is not installed")
 class TestTheTemporalRouteIsNowAvailable:
     """This class used to assert the opposite, and the change is the point.
 
