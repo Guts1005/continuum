@@ -1069,6 +1069,7 @@
     <div class="sidebar-group-label">Safety</div>
     <a class="sidebar-link" onclick="scrollToAnchor('run-safety')">Input / Output Scanning</a>
     <a class="sidebar-link" onclick="scrollToAnchor('run-data-labels')">Data-Label Enforcement</a>
+    <a class="sidebar-link" onclick="scrollToAnchor('run-approval')">Human-in-the-Loop Approval</a>
     <a class="sidebar-link" onclick="scrollToAnchor('run-testing')">Testing Guide</a>
   </div>
 
@@ -2623,6 +2624,96 @@ runner = <span class="cls">AgentRunner</span>()  <span class="cm"># one per app;
   <h3>Example</h3>
   <p>A complete, runnable example lives at <code>playground/data-label-clinic/</code>.</p>
 
+
+
+  <a class="anchor" id="run-approval"></a>
+  <h2>Human-in-the-Loop Approval</h2>
+  <p>Put a <strong>person</strong> in front of a tool call. A declared tool's call is suspended, a handler you supply is shown the tool name <strong>and its arguments</strong>, and the call proceeds only if the answer is yes. Continuum already had two controls either side of this — <a onclick="scrollToAnchor('comp-mcp')" style="cursor:pointer;text-decoration:underline">tool-trust</a> verifies the <em>catalogue</em> a server serves, and the <a onclick="scrollToAnchor('run-data-labels')" style="cursor:pointer;text-decoration:underline">policy gate</a> decides whether a run may touch a <em>resource</em> — but neither can see a call's arguments, so neither can tell a routine call from a consequential one.</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="cm">policy gate: tool:transfer_funds                    ─▶ allow</span>
+<span class="cm">approval:    transfer_funds {"amount": 5000000}     ─▶ ask a person</span></pre></div>
+
+  <p><strong>Independent of the policy gate.</strong> The policy gate answers <em>"is this run allowed this kind of thing?"</em> from rules, every time, with no human. This answers <em>"should this particular call happen?"</em> and only for tools you name. They compose: the policy gate runs first, and a call it denies never reaches a reviewer.</p>
+
+  <h3>Defaults — opt-in &amp; inert</h3>
+  <p>With nothing configured the feature does nothing — no lookup on the call path, no behavior change, fully backward-compatible.</p>
+  <table>
+    <tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+    <tr><td><code>AgentConfig.tool_approval</code></td><td><code>set()</code></td><td>no tool call is put to a human</td></tr>
+    <tr><td><code>AgentConfig.approval_handler</code></td><td><code>None</code></td><td>nobody to ask</td></tr>
+    <tr><td><code>AgentConfig.approval_timeout</code></td><td><code>30.0</code></td><td>seconds before an unanswered call is denied</td></tr>
+  </table>
+
+  <h3>Enable it in three steps</h3>
+  <p><strong>1 · Declare which tools need a person.</strong> fnmatch patterns, matched against the tool name as the model calls it.</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="cls">AgentConfig</span>(tool_approval={<span class="str">"send_*"</span>, <span class="str">"*transfer_funds"</span>})</pre></div>
+
+  <p><strong>2 · Write a handler.</strong> Any async callable of this shape — no base class, no registration:</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre>ToolApprovalHandler = Callable[[ToolApprovalRequest], Awaitable[ToolApprovalDecision]]
+
+<span class="kw">async def</span> <span class="fn">approve_in_slack</span>(request: ToolApprovalRequest) -&gt; ToolApprovalDecision:
+    ok = <span class="kw">await</span> ask_somewhere(request.tool_name, request.arguments)
+    <span class="kw">return</span> ToolApprovalDecision(approved=ok, reviewer=<span class="str">"alice"</span>)</pre></div>
+
+  <p><strong>3 · Wire it.</strong> Both fields, or the gate refuses:</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="cls">AgentConfig</span>(
+    tool_approval={<span class="str">"send_*"</span>},
+    approval_handler=approve_in_slack,
+    approval_timeout=<span class="num">30.0</span>,
+)</pre></div>
+  <p>Declaring a tool with no handler wired is <strong>not</strong> silently ungated — it is denied, loudly. That configuration is the one most easily mistaken for protection.</p>
+
+  <h3>Three outcomes, not two</h3>
+  <table>
+    <tr><th></th><th><code>approved</code></th><th><code>deferred</code></th><th>The model is told</th></tr>
+    <tr><td><strong>approved</strong></td><td><code>True</code></td><td><code>False</code></td><td><em>(nothing — the tool runs)</em></td></tr>
+    <tr><td><strong>denied</strong></td><td><code>False</code></td><td><code>False</code></td><td><code>APPROVAL DENIED</code></td></tr>
+    <tr><td><strong>deferred</strong></td><td><code>False</code></td><td><code>True</code></td><td><code>APPROVAL PENDING</code> — not performed, ask again once reviewed</td></tr>
+  </table>
+  <p><code>deferred</code> is for a call handed to someone who will answer <strong>later</strong>: the turn ends now, the user is told it is pending, and a later run asking the same thing proceeds. Without it, a deferral and a refusal are the same value, so the model reports <em>DENIED</em> for something merely waiting — and a user told they were refused does not go looking for an approver.</p>
+  <p><strong>Only a handler may defer.</strong> A timeout or a crash is a refusal: nothing is queued, so promising a resumption would promise something nothing is going to deliver.</p>
+  <p>A refusal becomes a <strong>tool result</strong>, not a raised exception. The model reads it and tells the user; the turn ends normally rather than crashing over a decision the system made on purpose.</p>
+
+  <h3>What the handler is shown</h3>
+  <table>
+    <tr><th>Field</th><th>Why it is there</th></tr>
+    <tr><td><code>tool_name</code></td><td>which tool, as the model named it</td></tr>
+    <tr><td><code>arguments</code></td><td><strong>the reason this gate exists</strong> — invisible to tool-trust and the policy gate</td></tr>
+    <tr><td><code>data_labels</code></td><td>the run's taint. <em>"This run has read the public web"</em> is what a reviewer wants to know before approving an outbound action</td></tr>
+    <tr><td><code>agent_name</code>, <code>run_id</code></td><td>attribution, and the material for your own idempotency key</td></tr>
+  </table>
+  <p>The request is frozen: a handler cannot edit the arguments the gate is about to run.</p>
+
+  <h3>It fails closed</h3>
+  <table>
+    <tr><th>Path</th><th>Result</th></tr>
+    <tr><td>handler does not answer within <code>approval_timeout</code></td><td>denied</td></tr>
+    <tr><td>handler raises</td><td>denied</td></tr>
+    <tr><td>handler returns a bare <code>True</code>, <code>None</code>, anything else</td><td>denied</td></tr>
+    <tr><td>tool declared with no handler wired</td><td>denied</td></tr>
+  </table>
+  <p>Approvals are <strong>serialised</strong> — concurrent tool calls in one turn are put to the reviewer one at a time, so two prompts never race for one terminal.</p>
+  <p>Approvals are <strong>not remembered</strong>: a retried run asks again. A cached "approve" authorises an execution the reviewer never saw, and whether a retry is the same action depends on the tool — transferring money and sending a reminder want opposite answers. <code>run_id</code> and <code>arguments</code> are on the request so your app can build the key it needs; the SDK does not pick one, because half-built idempotency looks like protection while quietly authorising repeats. If you want it remembered, do it in your app — see below.</p>
+
+  <h3>If you want approvals remembered</h3>
+  <p>Do it in your app, not in the SDK. An approval handler is just <code>async (request) -&gt; decision</code>, so wrap yours in one that looks up a store first and writes the answer back after.</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre>approval_handler = remembering(my_handler, key=..., store=redis)</pre></div>
+  <p>You choose the key — the arguments, a business id, or nothing at all — because only you know whether running your tool twice is safe. Two rules: never cache a <code>deferred</code> (nobody answered yet), and delete a cached answer once it is used, so one approval authorises one execution rather than becoming a standing permit. <code>queue_approval_handler</code> in <code>approval_ui.py</code> is a working example.</p>
+
+  <h3>A reviewer who answers in an hour</h3>
+  <p>A blocking handler holds the caller's connection open, so it is bounded by whatever a browser or proxy tolerates. For a reviewer who is not watching, Continuum ships a Temporal handler:</p>
+  <div class="code-wrapper"><button class="copy-btn" onclick="copyCode(this)">copy</button><pre><span class="kw">from</span> continuum.temporal <span class="kw">import</span> temporal_tool_approval
+
+<span class="cls">AgentConfig</span>(
+    tool_approval={<span class="str">"*transfer_funds"</span>},
+    approval_handler=temporal_tool_approval(),   <span class="cm"># finds its own workflow</span>
+    approval_timeout=<span class="num">600.0</span>,
+)</pre></div>
+  <p>It registers the request on the running workflow and waits for the same <code>submit_approval</code> signal a planned approval step uses — the same reviewer UI, the same allow-list check. A tool approval is not a second, weaker door.</p>
+  <p>The whole agent turn is one activity, so the call <strong>blocks in place and resumes</strong>: work done before the gate is not repeated and nobody has to ask again. It does <strong>not</strong> survive a worker restart — a retried activity starts from the beginning. For a reviewer who may outlast a deploy, the deferred shape is the honest answer, because it holds nothing open at all.</p>
+  <p>Every failure defers rather than denying: an unreachable workflow is not a reviewer saying no.</p>
+
+  <h3>Example</h3>
+  <p>Six scenarios, live — including a timeout failing closed, refuse-and-resume, and a durable wait through Temporal — at <code>playground/data-label-clinic/docs/F7-approval.md</code>.</p>
 
   <a class="anchor" id="run-testing"></a>
   <h2>Testing Guide</h2>
